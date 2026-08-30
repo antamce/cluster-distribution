@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+Synpo Results/
+*.synpo.json
+*.tif
+*.tiff
+*.zarr/
+.synpo-cache/
