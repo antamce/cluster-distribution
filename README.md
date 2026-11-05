@@ -27,7 +27,8 @@ This is the **0.8.0 beta release**. It is intended for supervised scientific use
 - Shows responsive batch progress bars with completed work, elapsed time, and a rough remaining-time estimate for preprocessing, detection, and measurement.
 - Exports verified Excel and CSV tables, settings, audit information, and optional validation PDFs.
 
-Synpo calculates measurements only. Perform statistical hypothesis testing in separate statistics software.
+Synpo includes an auditable post-clustering statistics panel; raw measurements
+remain exportable for independent confirmation in other statistics software.
 
 ## Requirements
 
@@ -168,9 +169,13 @@ spine-to-dendrite, dendrite-to-spine, Trim, Expand, Eraser), Ctrl+0 selects
 Filopodium, and Enter applies the correction.
 
 From Review, use the preprocessing or detection rerun buttons to edit parameters
-for the selected specimen. A preprocessing rerun automatically continues into
-detection. Either route warns before permanently discarding that specimen's manual
-corrections and history.
+for the selected specimen. Preprocessing is channel-specific. Refreshing the
+protein-cluster channel automatically reruns only cluster detection and preserves
+the completed review, correction history, undo state, object statuses, and corrected
+dendrite/spine masks. Refreshing the dendrite/spine channel or explicitly rerunning
+full detection warns before permanently discarding manual corrections and history.
+A separate **Preprocess selected specimen** button retains the both-channel,
+full-redetection workflow for one specimen.
 
 The **Save project** button remains visible below every workflow step and saves committed state without applying pending controls.
 
@@ -286,6 +291,25 @@ The standard and advanced clustering tabs also provide a cluster-count score pan
 with an annotated score curve and exact-value table for all three methods. Rejected
 small-cluster candidates and the solution selected for the saved run are identified.
 
+The geometry, plot, score, correlation, and statistics pages in both clustering tabs scroll
+independently in both directions on smaller windows, so laptop users can reach the
+complete controls and full-size figures instead of having them clipped.
+
+Each clustering tab also includes a scrollable **Group statistics** panel.
+Statistical groups are selected separately from groups merely displayed on scatter
+plots. Users can choose spine, specimen, or manually assigned neuron/subject as the
+analysis level. The panel provides Pearson chi-square/Cramer's V, all-pairs
+Agresti-Caffo cluster-percentage comparisons, equal-weight unit permutations,
+within-cluster continuous metric comparisons, protein-puncta presence tests,
+Benjamini-Hochberg q-values, stacked/grouped bars, pies, chi-square residuals,
+confidence-interval forests, unit-fraction plots, continuous-metric distributions,
+and pooled/unit protein-presence plots. Metric and cluster selectors expose every
+performed comparison without annotations covering the observations. Metrics used
+to construct clusters are marked descriptive-only. Full exports include every
+applicable graph as SVG, PDF, and 600-DPI PNG. The full specification is in
+`STATISTICAL_METHODS.md`, and every exported run includes its own exact
+methods/settings Markdown file.
+
 Each clustering tab also has a **Feature correlations** panel for detecting
 redundant morphology inputs before interpreting clusters. Users independently
 select metrics, then inspect a listwise-complete Pearson heatmap across included
@@ -308,6 +332,8 @@ analysis exclusion audit.
 
 One or more experimental groups can be selected for each named run. Scatter plots
 show group membership with distinct marker shapes while preserving cluster colors.
+An independent saved visibility list can show only selected groups on scatter plots
+without changing clustering or statistical samples.
 Axes and background colors and opacity are editable and are retained in exported
 figures. Plot legends can be hidden or placed inside, outside-right, or below the
 plot. Any two selected clustering features can be plotted against one another using
@@ -333,7 +359,11 @@ and PCC/PCUMAP (Gildenblat and Pahnke) clustering while retaining PCA as the
 default interpretable baseline in tab 6. Users choose a 2-20 dimensional embedding
 and a 2D or 3D view; Gaussian mixture, Ward, or k-means receives the full fitted
 embedding as its clustering input. Plot color identifies cluster and marker shape
-identifies experimental group. Protein puncta remain descriptive-only.
+identifies experimental group. Protein puncta remain descriptive-only in the
+ordinary PCA tab. Advanced runs may explicitly add puncta count/volume/position or
+reviewed calcium peak/Pearson measurements as clustering inputs; these choices are
+off by default and saved in the analysis audit. Accepted-link changes mark dependent
+advanced runs stale for refitting.
 
 UMAP controls include neighbors, minimum distance, metric, iterations, and seed.
 PCC/PCUMAP also exposes reference points, beta, correlation-loss weight/start, and
@@ -351,6 +381,35 @@ workbook can also be re-clustered through
 **File -> Cluster exported morphology workbook...** without the original project
 or TIFF files.
 
+## Calcium imaging to post-IHC matching
+
+The **8. Calcium matching** tab imports an analyzed calcium-results folder without
+altering it. It reads recording/spine/parent-segment identities, `Spine peak dFF/F0`,
+`Pearson r`, additional numeric trace-analysis fields, ImageJ spine and dendrite ROI
+ZIPs, and the 2D cytoplasm reference images. It accepts the canonical spine-metrics
+CSV or the labeled specimen sheets in `experiment_spine_summary.xlsx`. Portable
+copies of reference images and
+parsed ROI geometry are kept in the Synpo cache, and an external folder can later be
+checksum-relinked.
+
+Users manually pair calcium specimens with one or more higher-magnification Synpo
+fields and register corresponding landmarks with similarity, affine, or piecewise
+transforms. Automatic spine matching then uses transformed spine position and
+parent-dendrite consistency in a global one-to-one assignment. Proposals retain
+confidence and distance information and can be confirmed, marked probable or
+ambiguous, ignored, cleared, or manually replaced. Reviewed decisions survive an
+automatic refresh, and all still-unmatched calcium ROIs can be ignored together.
+
+Calcium peak, spine-parent correlation, and other imported numeric metrics can be
+plotted against protein-puncta or morphology measurements within saved morphology
+clusters. Cluster colors and experimental-group marker shapes are preserved;
+multiple named calcium analysis views preserve the exact metric/filter/style
+choices. Match-confidence states and one or more groups can be selected. The panel reports
+per-cluster Pearson, Spearman, regression, specimen counts, and specimen-bootstrap
+intervals. Its separate export contains audited Excel/CSV tables plus SVG/PDF and
+600-DPI PNG figures. Full transfer ZIPs retain the calcium dataset, registrations,
+reviewed links, and embedded references for reopening on another computer.
+
 Source TIFFs are never modified. The compressed project cache can be removed after final export has been verified.
 
 ## Beta-release notes
@@ -364,7 +423,11 @@ Source TIFFs are never modified. The compressed project cache can be removed aft
 - Named morphology analyses now support PCA, UMAP, and PCC/PCUMAP; GMM, Ward, and
   k-means; reviewed-only and experimental-group subsets; configurable plots and
   high-resolution exports; explicit PCA equations and feature vectors; and
-  descriptive-only protein-puncta summaries.
+  descriptive protein-puncta summaries, with optional multimodal puncta/calcium
+  inputs confined to Advanced Clustering.
+- Calcium-to-post-IHC matching adds landmark registration, constrained one-to-one
+  spine matching and review, cluster-aware calcium/puncta analysis, portable
+  transfer state, and audited high-resolution exports.
 - Automatic cluster-count selection offers information criterion, silhouette, and
   elbow methods. Candidate-score panels show exact scores for every cluster count,
   and PCA feature-vector views can fade or hide spine points.
@@ -375,6 +438,8 @@ Source TIFFs are never modified. The compressed project cache can be removed aft
   specimen exclusion, multiple rectangular analysis ROIs, direct Z-slider mapping,
   keyboard specimen navigation, and explicit per-specimen preprocessing/detection
   reruns.
+- Protein-cluster preprocessing and cluster detection can be refreshed independently
+  without changing completed manual dendrite/spine corrections or review state.
 - Manual correction adds a literal eraser, exactly-two-way splitting, fixed brush
   hotkeys, Enter-to-apply, and disjoint dendrite/spine object colors.
 - Disconnected two-part spines can use a review-required virtual centerline bridge;

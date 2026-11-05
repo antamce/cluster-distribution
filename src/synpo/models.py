@@ -90,6 +90,7 @@ class SpecimenPair:
     batch_prefix: str
     experimental_group: str
     specimen_id: str
+    neuron_id: str = ""
     channels: dict[str, ChannelFile] = field(default_factory=dict)
     issues: list[ImportIssue] = field(default_factory=list)
     import_mode: str = "strict"

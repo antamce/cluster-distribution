@@ -123,6 +123,11 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
     )
     morphology_analysis.setdefault("runs", [])
     morphology_analysis.setdefault("active_run_id", None)
+    calcium_analysis = manifest.setdefault(
+        "calcium_analysis", {"datasets": [], "active_dataset_id": None}
+    )
+    calcium_analysis.setdefault("datasets", [])
+    calcium_analysis.setdefault("active_dataset_id", None)
     import_settings = manifest.setdefault(
         "import_settings",
         {
@@ -150,6 +155,7 @@ def migrate_manifest(manifest: dict[str, object]) -> dict[str, object]:
         "settings_by_channel", default_preprocessing_manifest()["settings_by_channel"]
     )
     for specimen_index, specimen in enumerate(manifest.get("specimens", [])):
+        specimen.setdefault("neuron_id", str(specimen.get("specimen_id", "")))
         for channel_data in specimen.get("channels", {}).values():
             channel_data.setdefault(
                 "source_path",
@@ -292,6 +298,7 @@ def create_project_manifest(
                 "batch_prefix": pair.batch_prefix,
                 "experimental_group": pair.experimental_group,
                 "specimen_id": pair.specimen_id,
+                "neuron_id": pair.neuron_id.strip() or pair.specimen_id,
                 "channels": channels,
                 "checkpoints": {
                     "preprocessing": "not_started",
@@ -325,6 +332,7 @@ def create_project_manifest(
         "review_settings": default_review_manifest(),
         "measurements": default_measurements_manifest(),
         "morphology_analysis": {"runs": [], "active_run_id": None},
+        "calcium_analysis": {"datasets": [], "active_dataset_id": None},
         "cache": {"format": "zarr-v2-blosc-zstd", "path": None, "deletion_eligible": False},
         "specimens": specimens,
     }

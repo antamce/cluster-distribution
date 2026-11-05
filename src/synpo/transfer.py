@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import hashlib
 import json
 import os
@@ -174,6 +175,7 @@ def settings_only_manifest(manifest: dict[str, object]) -> dict[str, object]:
         specimen["distribution_review"] = {"spines": {}, "updated_at": None}
         specimen["morphology_review"] = {"spines": {}, "updated_at": None}
     result["morphology_analysis"] = {"runs": [], "active_run_id": None}
+    result["calcium_analysis"] = {"datasets": [], "active_dataset_id": None}
     return result
 
 
@@ -220,6 +222,30 @@ def _validate_full_cache(manifest: dict[str, object], root: Path) -> None:
                 raise TransferCacheError(
                     f"The measurement cache is missing for specimen {index + 1}."
                 )
+    for dataset in manifest.get("calcium_analysis", {}).get("datasets", []):
+        dataset_id = str(dataset.get("dataset_id", ""))
+        path = root / "calcium-analysis" / f"dataset-{dataset_id}.json.gz"
+        if not dataset_id or not path.is_file():
+            raise TransferCacheError(
+                "The calcium matching cache is missing for dataset "
+                f"{dataset.get('name', dataset_id or 'unknown')!r}."
+            )
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as stream:
+                calcium_data = json.load(stream)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise TransferCacheError(
+                f"The calcium matching cache is damaged for dataset {dataset_id!r}."
+            ) from exc
+        if calcium_data.get("embedded_reference_images"):
+            for recording in calcium_data.get("recordings", []):
+                member = str(recording.get("reference_image_member") or "")
+                image = root / "calcium-analysis" / member
+                if not member or not image.is_file():
+                    raise TransferCacheError(
+                        "An embedded calcium reference image is missing for "
+                        f"recording {recording.get('recording_id', 'unknown')!r}."
+                    )
 
 
 def create_transfer_archive(

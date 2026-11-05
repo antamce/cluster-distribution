@@ -18,12 +18,17 @@ from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.spatial.distance import squareform
 from scipy.special import logsumexp
 
+from .clustering_statistics import (
+    ClusteringStatisticsSettings,
+    draw_cluster_statistics,
+    statistical_methods_markdown,
+)
 from .measurements import filtered_measurement_result
 from .preprocessing import project_cache_path
 from .project import save_project
 
 
-MORPHOLOGY_FEATURES: dict[str, tuple[str, str]] = {
+STANDARD_MORPHOLOGY_FEATURES: dict[str, tuple[str, str]] = {
     "log_volume": ("Log spine volume", "volume_um3"),
     "linear_volume": ("Linear spine volume", "volume_um3"),
     "sqrt_volume": ("Square-root spine volume", "volume_um3"),
@@ -39,6 +44,44 @@ MORPHOLOGY_FEATURES: dict[str, tuple[str, str]] = {
     "neck_volume": ("Neck volume", "neck_volume_um3"),
     "surface_area": ("Surface area", "surface_area_um2"),
     "sphericity": ("Sphericity", "sphericity"),
+}
+
+PROTEIN_CLUSTERING_FEATURES: dict[str, tuple[str, str]] = {
+    "protein_puncta_count": ("Protein puncta count", "protein_puncta_count"),
+    "protein_puncta_total_volume": (
+        "Protein puncta total volume",
+        "protein_puncta_total_volume_um3",
+    ),
+    "protein_puncta_volume_ratio": (
+        "Protein puncta / spine volume",
+        "protein_puncta_to_spine_volume_ratio",
+    ),
+    "protein_puncta_mean_volume": (
+        "Protein puncta mean volume",
+        "protein_puncta_mean_volume_um3",
+    ),
+    "protein_puncta_axis_position": (
+        "Protein puncta shaft-to-tip centroid",
+        "protein_puncta_axis_centroid_fraction",
+    ),
+}
+
+CALCIUM_CLUSTERING_FEATURES: dict[str, tuple[str, str]] = {
+    "calcium_peak_dff": ("Calcium spine peak ΔF/F0", "calcium_spine_peak_dff"),
+    "calcium_pearson_r": (
+        "Calcium spine-parent Pearson r",
+        "calcium_pearson_r",
+    ),
+}
+
+INCLUSIVE_CLUSTERING_FEATURES: dict[str, tuple[str, str]] = {
+    **PROTEIN_CLUSTERING_FEATURES,
+    **CALCIUM_CLUSTERING_FEATURES,
+}
+
+MORPHOLOGY_FEATURES: dict[str, tuple[str, str]] = {
+    **STANDARD_MORPHOLOGY_FEATURES,
+    **INCLUSIVE_CLUSTERING_FEATURES,
 }
 
 DEFAULT_FEATURES = (
@@ -66,6 +109,7 @@ DEFAULT_PLOT_STYLE = {
     "custom_y_feature": "",
     "pca_show_points": True,
     "pca_point_alpha": 0.68,
+    "visible_groups": [],
     "correlation_features": list(DEFAULT_FEATURES),
     "correlation_scope": "__pooled__",
     "correlation_threshold": 0.80,
@@ -108,6 +152,21 @@ class MorphologyClusteringSettings:
     pcumap_correlation_start: int = 10
     pcumap_device: str = "cpu"
     embedding_stability_repetitions: int = 3
+    calcium_dataset_id: str = ""
+    calcium_dataset_ids: tuple[str, ...] = ()
+    calcium_match_states: tuple[str, ...] = ("confirmed",)
+
+    def selected_calcium_dataset_ids(self) -> tuple[str, ...]:
+        """Return the selected datasets, including legacy single-dataset runs."""
+
+        values = self.calcium_dataset_ids
+        if not values and self.calcium_dataset_id.strip():
+            values = (self.calcium_dataset_id,)
+        return tuple(
+            dict.fromkeys(
+                str(value).strip() for value in values if str(value).strip()
+            )
+        )
 
     def validate(self) -> None:
         if self.algorithm not in {"gaussian_mixture", "ward", "kmeans"}:
@@ -117,6 +176,17 @@ class MorphologyClusteringSettings:
         unknown = sorted(set(self.features) - set(MORPHOLOGY_FEATURES))
         if unknown:
             raise ValueError("Unknown morphology feature(s): " + ", ".join(unknown))
+        calcium_features = set(self.features) & set(CALCIUM_CLUSTERING_FEATURES)
+        if calcium_features and not self.selected_calcium_dataset_ids():
+            raise ValueError(
+                "Select one or more calcium-matching datasets when calcium features "
+                "are clustering inputs."
+            )
+        allowed_match_states = {"confirmed", "probable", "ambiguous"}
+        if set(self.calcium_match_states) - allowed_match_states:
+            raise ValueError("Unknown accepted calcium-match confidence state.")
+        if calcium_features and not self.calcium_match_states:
+            raise ValueError("Select at least one accepted calcium-match state.")
         volume = {"log_volume", "linear_volume", "sqrt_volume"} & set(self.features)
         if len(volume) > 1:
             raise ValueError("Choose only one spine-volume transformation.")
@@ -191,6 +261,26 @@ class MorphologyClusteringSettings:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "MorphologyClusteringSettings":
+        legacy_calcium_id = str(value.get("calcium_dataset_id", "")).strip()
+        raw_calcium_ids = value.get("calcium_dataset_ids", ())
+        if isinstance(raw_calcium_ids, (list, tuple)):
+            calcium_ids = tuple(
+                dict.fromkeys(
+                    str(dataset_id).strip()
+                    for dataset_id in raw_calcium_ids
+                    if str(dataset_id).strip()
+                )
+            )
+        else:
+            calcium_ids = (
+                (str(raw_calcium_ids).strip(),)
+                if str(raw_calcium_ids).strip()
+                else ()
+            )
+        if not calcium_ids and legacy_calcium_id:
+            calcium_ids = (legacy_calcium_id,)
+        if not legacy_calcium_id and len(calcium_ids) == 1:
+            legacy_calcium_id = calcium_ids[0]
         settings = cls(
             algorithm=str(value.get("algorithm", "gaussian_mixture")),
             features=tuple(value.get("features", DEFAULT_FEATURES)),
@@ -221,6 +311,12 @@ class MorphologyClusteringSettings:
             pcumap_correlation_start=int(value.get("pcumap_correlation_start", 10)),
             pcumap_device=str(value.get("pcumap_device", "cpu")),
             embedding_stability_repetitions=int(value.get("embedding_stability_repetitions", 3)),
+            calcium_dataset_id=legacy_calcium_id,
+            calcium_dataset_ids=calcium_ids,
+            calcium_match_states=tuple(
+                str(state)
+                for state in value.get("calcium_match_states", ("confirmed",))
+            ),
         )
         settings.validate()
         return settings
@@ -267,6 +363,13 @@ def collect_morphology_rows(manifest: dict[str, object]) -> list[dict[str, objec
             rows.append(
                 {
                     **dict(morphology),
+                    # Project labels remain authoritative after manual regrouping,
+                    # including for measurement caches created by older releases.
+                    "experimental_group": str(specimen["experimental_group"]),
+                    "specimen_id": str(specimen["specimen_id"]),
+                    "neuron_id": str(
+                        specimen.get("neuron_id") or specimen["specimen_id"]
+                    ),
                     "volume_um3": spine.get("volume_um3"),
                     "spine_valid": spine.get("spine_valid", True),
                     "manual_spine_valid": spine.get("manual_spine_valid", spine.get("spine_valid", True)),
@@ -2145,7 +2248,12 @@ def run_morphology_clustering(
         "embedding_metadata": embedding_metadata,
         "embedding_stability": embedding_stability,
         "pca_loadings": loadings,
-        "protein_metrics_used_for_clustering": False,
+        "protein_metrics_used_for_clustering": bool(
+            set(settings.features) & set(PROTEIN_CLUSTERING_FEATURES)
+        ),
+        "calcium_metrics_used_for_clustering": bool(
+            set(settings.features) & set(CALCIUM_CLUSTERING_FEATURES)
+        ),
     }
 
 
@@ -2158,7 +2266,18 @@ def save_named_morphology_run(
     clean_name = str(name).strip()
     if not clean_name:
         raise ValueError("Enter a name for this morphology analysis run.")
-    result = run_morphology_clustering(collect_morphology_rows(manifest), settings)
+    rows = collect_morphology_rows(manifest)
+    if set(settings.features) & set(CALCIUM_CLUSTERING_FEATURES):
+        from .calcium import merge_calcium_features
+
+        for dataset_id in settings.selected_calcium_dataset_ids():
+            rows = merge_calcium_features(
+                manifest,
+                rows,
+                dataset_id,
+                settings.calcium_match_states,
+            )
+    result = run_morphology_clustering(rows, settings)
     analysis = manifest.setdefault("morphology_analysis", {"runs": [], "active_run_id": None})
     existing = next((item for item in analysis.setdefault("runs", []) if item.get("name") == clean_name), None)
     run_id = str(existing.get("run_id")) if existing else uuid.uuid4().hex
@@ -2249,6 +2368,11 @@ def update_run_plot_style(
         "pca_point_alpha": min(
             1.0, max(0.0, float(plot_style.get("pca_point_alpha", 0.68)))
         ),
+        "visible_groups": [
+            str(group)
+            for group in plot_style.get("visible_groups", [])
+            if str(group)
+        ],
         "correlation_features": [
             str(feature)
             for feature in plot_style.get("correlation_features", DEFAULT_FEATURES)
@@ -2295,6 +2419,34 @@ def update_run_plot_style(
     return result
 
 
+def update_run_statistics(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    run_id: str,
+    statistics_result: dict[str, object],
+) -> dict[str, object]:
+    """Persist post-clustering statistics inside a named analysis run."""
+
+    result = load_morphology_run(manifest, run_id)
+    ClusteringStatisticsSettings.from_dict(
+        dict(statistics_result.get("settings", {}))
+    )
+    result["statistics"] = dict(statistics_result)
+    path = morphology_run_path(manifest, run_id)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=6) as stream:
+        json.dump(result, stream, separators=(",", ":"))
+    os.replace(temporary, path)
+    for record in manifest.get("morphology_analysis", {}).get("runs", []):
+        if str(record.get("run_id")) == run_id:
+            record["statistics_settings"] = dict(
+                statistics_result.get("settings", {})
+            )
+            record["statistics_created_at"] = statistics_result.get("created_at")
+    save_project(project_path, manifest)
+    return result
+
+
 def _columns(rows: list[dict[str, object]]) -> list[str]:
     output: list[str] = []
     for row in rows:
@@ -2326,11 +2478,25 @@ def export_morphology_analysis(
         if reduction_method in {"umap", "pcumap"}
         else 0
     )
+    export_plot_style = {
+        **DEFAULT_PLOT_STYLE,
+        **dict(result.get("plot_style", {})),
+    }
+    exported_visible_groups = {
+        str(group)
+        for group in export_plot_style.get("visible_groups", [])
+        if str(group)
+    }
     settings_rows = [
         {
             "section": "clustering",
             **dict(result["settings"]),
-            "protein_metrics_used_for_clustering": False,
+            "protein_metrics_used_for_clustering": bool(
+                result.get("protein_metrics_used_for_clustering", False)
+            ),
+            "calcium_metrics_used_for_clustering": bool(
+                result.get("calcium_metrics_used_for_clustering", False)
+            ),
         },
         {"section": "run", "name": result.get("name", ""), "run_id": result.get("run_id", ""), "input_signature": result.get("input_signature", ""), "selected_cluster_count": result.get("selected_cluster_count")},
         {"section": "plot_style", **{**DEFAULT_PLOT_STYLE, **dict(result.get("plot_style", {}))}},
@@ -2339,6 +2505,7 @@ def export_morphology_analysis(
         {
             "experimental_group": row.get("experimental_group"),
             "specimen_id": row.get("specimen_id"),
+            "neuron_id": row.get("neuron_id"),
             "spine_id": row.get("spine_id"),
             "morphology_cluster_id": row.get("morphology_cluster_id"),
             "cluster_color": next(
@@ -2366,6 +2533,8 @@ def export_morphology_analysis(
             },
         }
         for row in result.get("assignments", [])
+        if not exported_visible_groups
+        or str(row.get("experimental_group", "")) in exported_visible_groups
     ]
     interpretation = pca_interpretation_data(result)
     equation_rows = [
@@ -2470,13 +2639,18 @@ def export_morphology_analysis(
             correlation_group_table.extend(
                 correlation_matrix_rows(group_data, group)
             )
+    statistics_result = (
+        dict(result.get("statistics", {}))
+        if isinstance(result.get("statistics"), dict)
+        else {}
+    )
     tables = {
         "Spine_Morphology": list(result.get("assignments", [])),
         "Spine_Cluster_Assignments": [
             {
                 key: row.get(key)
                 for key in (
-                    "experimental_group", "specimen_id", "roi_id", "dendrite_id",
+                    "experimental_group", "specimen_id", "neuron_id", "roi_id", "dendrite_id",
                     "spine_id", "morphology_cluster_id",
                     "morphology_cluster_probability", "pca_1", "pca_2", "pca_3",
                     *tuple(
@@ -2531,6 +2705,40 @@ def export_morphology_analysis(
             }
         ],
         "Feature_Corr_By_Group": correlation_group_table,
+        "Statistics_Settings": (
+            [dict(statistics_result.get("settings", {}))]
+            if statistics_result
+            else [{"status": "Inferential statistics were not calculated for this run."}]
+        ),
+        "Cluster_Composition": list(
+            statistics_result.get("composition_summary", [])
+        ),
+        "Composition_Omnibus": list(
+            statistics_result.get("composition_omnibus", [])
+        ),
+        "Agresti_Caffo": list(statistics_result.get("agresti_caffo", [])),
+        "Unit_Cluster_Fractions": list(
+            statistics_result.get("unit_composition", [])
+        ),
+        "Unit_Permutation_Tests": list(
+            statistics_result.get("unit_permutation", [])
+        ),
+        "Metric_Descriptives": list(
+            statistics_result.get("metric_descriptives", [])
+        ),
+        "Metric_Comparisons": list(
+            statistics_result.get("metric_comparisons", [])
+        ),
+        "Protein_Presence_Tests": list(
+            statistics_result.get("protein_presence_comparisons", [])
+        ),
+        "Protein_Presence_Unit": list(
+            statistics_result.get("protein_presence_unit_permutation", [])
+        ),
+        "Statistics_Warnings": [
+            {"warning": warning}
+            for warning in statistics_result.get("warnings", [])
+        ],
     }
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -2564,6 +2772,8 @@ def export_morphology_analysis(
     definitions = list(result.get("cluster_definitions", []))
     colors = {int(row["morphology_cluster_id"]): str(row["color"]) for row in definitions}
     groups = sorted({str(row.get("experimental_group", "")) for row in assignments})
+    visible_groups = exported_visible_groups
+    scatter_groups = [group for group in groups if not visible_groups or group in visible_groups]
     marker_values = ("o", "^", "s", "D", "P", "X", "v", "<", ">", "*")
     marker_by_group = {
         group: marker_values[index % len(marker_values)]
@@ -2572,7 +2782,7 @@ def export_morphology_analysis(
     figures: list[tuple[str, object]] = []
     figure, axis = plt.subplots(figsize=(8, 6))
     for cluster in sorted(colors):
-        for group in groups:
+        for group in scatter_groups:
             members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster and str(row.get("experimental_group", "")) == group and row.get("volume_um3") is not None and row.get("spine_curvilinear_length_um") is not None]
             if members:
                 axis.scatter([float(row["volume_um3"]) for row in members], [float(row["spine_curvilinear_length_um"]) for row in members], s=18, alpha=0.7, color=colors[cluster], marker=marker_by_group[group], label=f"Cluster {cluster} · {group}")
@@ -2583,7 +2793,7 @@ def export_morphology_analysis(
     figures.append(("volume_vs_length", figure))
     figure, axis = plt.subplots(figsize=(8, 6))
     for cluster in sorted(colors):
-        for group in groups:
+        for group in scatter_groups:
             members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster and str(row.get("experimental_group", "")) == group and row.get("volume_um3") is not None and row.get("spine_base_to_tip_distance_um") is not None]
             if members:
                 axis.scatter([float(row["volume_um3"]) for row in members], [float(row["spine_base_to_tip_distance_um"]) for row in members], s=18, alpha=0.7, color=colors[cluster], marker=marker_by_group[group], label=f"Cluster {cluster} · {group}")
@@ -2597,7 +2807,7 @@ def export_morphology_analysis(
         figure = plt.figure(figsize=(8, 7))
         axis = figure.add_subplot(111, projection="3d")
         for cluster in sorted(colors):
-            for group in groups:
+            for group in scatter_groups:
                 members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster and str(row.get("experimental_group", "")) == group]
                 if members:
                     axis.scatter([row["pca_1"] for row in members], [row["pca_2"] for row in members], [row["pca_3"] for row in members], color=colors[cluster], marker=marker_by_group[group], label=f"Cluster {cluster} · {group}")
@@ -2605,7 +2815,7 @@ def export_morphology_analysis(
     else:
         figure, axis = plt.subplots(figsize=(8, 6))
         for cluster in sorted(colors):
-            for group in groups:
+            for group in scatter_groups:
                 members = [row for row in assignments if int(row["morphology_cluster_id"]) == cluster and str(row.get("experimental_group", "")) == group]
                 if members:
                     axis.scatter([row.get("pca_1") for row in members], [row.get("pca_2") for row in members], color=colors[cluster], marker=marker_by_group[group], label=f"Cluster {cluster} · {group}")
@@ -2624,7 +2834,7 @@ def export_morphology_analysis(
         else:
             figure, axis = plt.subplots(figsize=(8, 6))
         for cluster in sorted(colors):
-            for group in groups:
+            for group in scatter_groups:
                 members = [
                     row
                     for row in assignments
@@ -2778,7 +2988,7 @@ def export_morphology_analysis(
     if custom_x and custom_y:
         figure, axis = plt.subplots(figsize=(8, 6))
         for cluster in sorted(colors):
-            for group in groups:
+            for group in scatter_groups:
                 points = []
                 for row in assignments:
                     if (
@@ -2829,6 +3039,103 @@ def export_morphology_analysis(
         axis.set_title("Standardized morphology-cluster median profiles")
         figure.colorbar(image, ax=axis, label="Across-cluster standardized median")
         figures.append(("cluster_profile_heatmap", figure))
+    statistics_figure_specs: list[
+        tuple[str, str, str | None, int | None]
+    ] = []
+    if statistics_result:
+        for statistics_mode, filename in (
+            ("stacked", "statistics_cluster_composition_stacked"),
+            ("grouped", "statistics_cluster_composition_grouped"),
+            ("faceted_pies", "statistics_cluster_composition_pies"),
+            ("pooled_pie", "statistics_cluster_composition_pooled_pie"),
+            ("chi_square_residuals", "statistics_chi_square_residuals"),
+            ("forest", "statistics_agresti_caffo_forest"),
+        ):
+            figure = plt.figure(
+                figsize=(
+                    max(9.0, len(statistics_result.get("groups", [])) * 3.0),
+                    7.0,
+                )
+            )
+            draw_cluster_statistics(
+                figure, result, statistics_result, statistics_mode
+            )
+            figures.append((filename, figure))
+
+        def statistics_figure(
+            mode: str,
+            filename: str,
+            *,
+            metric: str | None = None,
+            cluster: int | None = None,
+        ) -> None:
+            statistics_figure_specs.append((mode, filename, metric, cluster))
+
+        unit_clusters = sorted(
+            {
+                int(row["morphology_cluster_id"])
+                for row in statistics_result.get("unit_permutation", [])
+            }
+        )
+        for cluster in unit_clusters:
+            statistics_figure(
+                "unit_cluster_fractions",
+                f"statistics_unit_cluster_{cluster}",
+                cluster=cluster,
+            )
+
+        metric_cluster_pairs = sorted(
+            {
+                (str(row["metric"]), int(row["morphology_cluster_id"]))
+                for row in statistics_result.get("metric_comparisons", [])
+            }
+        )
+        for metric, cluster in metric_cluster_pairs:
+            safe_metric = "".join(
+                character if character.isalnum() else "_"
+                for character in metric
+            ).strip("_") or "metric"
+            statistics_figure(
+                "metric_distribution",
+                f"statistics_metric_{safe_metric}_cluster_{cluster}",
+                metric=metric,
+                cluster=cluster,
+            )
+
+        pooled_protein_clusters = sorted(
+            {
+                int(row["morphology_cluster_id"])
+                for row in statistics_result.get(
+                    "protein_presence_comparisons", []
+                )
+            }
+        )
+        if pooled_protein_clusters:
+            statistics_figure(
+                "protein_presence_forest",
+                "statistics_protein_presence_forest",
+            )
+        for cluster in pooled_protein_clusters:
+            statistics_figure(
+                "protein_presence",
+                f"statistics_protein_presence_cluster_{cluster}",
+                cluster=cluster,
+            )
+
+        unit_protein_clusters = sorted(
+            {
+                int(row["morphology_cluster_id"])
+                for row in statistics_result.get(
+                    "protein_presence_unit_permutation", []
+                )
+            }
+        )
+        for cluster in unit_protein_clusters:
+            statistics_figure(
+                "protein_presence_unit",
+                f"statistics_protein_presence_unit_cluster_{cluster}",
+                cluster=cluster,
+            )
     plot_style = {**DEFAULT_PLOT_STYLE, **dict(result.get("plot_style", {}))}
     axes_rgba = to_rgba(
         str(plot_style["axes_color"]), alpha=float(plot_style["axes_alpha"])
@@ -2837,9 +3144,9 @@ def export_morphology_analysis(
         str(plot_style["background_color"]),
         alpha=float(plot_style["background_alpha"]),
     )
-    for _name, figure in figures:
+    def style_export_figure(_name, figure) -> None:  # type: ignore[no-untyped-def]
         if _name in {"pca_interpretation", "pca_3d_feature_axes"}:
-            continue
+            return
         figure.patch.set_facecolor(background_rgba)
         for styled_axis in figure.axes:
             styled_axis.set_facecolor(background_rgba)
@@ -2885,6 +3192,9 @@ def export_morphology_analysis(
                 legend.get_frame().set_facecolor(background_rgba)
                 for legend_text in legend.get_texts():
                     legend_text.set_color(axes_rgba)
+
+    for _name, figure in figures:
+        style_export_figure(_name, figure)
     pdf_path = path.with_name(f"{path.stem}_report.pdf")
     with PdfPages(pdf_path) as pdf:
         for name, figure in figures:
@@ -2893,7 +3203,108 @@ def export_morphology_analysis(
             figure.savefig(plot_directory / f"{name}.pdf", bbox_inches="tight", facecolor=background_rgba)
             pdf.savefig(figure, bbox_inches="tight", facecolor=background_rgba)
             plt.close(figure)
-    return {"workbook": str(path), "csv_directory": str(csv_directory), "plot_directory": str(plot_directory), "report_pdf": str(pdf_path), "verified": True}
+        for mode, name, metric, cluster in statistics_figure_specs:
+            figure = plt.figure(
+                figsize=(
+                    max(10.5, len(statistics_result.get("groups", [])) * 3.0),
+                    7.0,
+                )
+            )
+            draw_cluster_statistics(
+                figure,
+                result,
+                statistics_result,
+                mode,
+                selected_metric=metric,
+                selected_cluster=cluster,
+            )
+            style_export_figure(name, figure)
+            figure.savefig(
+                plot_directory / f"{name}.png",
+                dpi=600,
+                bbox_inches="tight",
+                facecolor=background_rgba,
+            )
+            figure.savefig(
+                plot_directory / f"{name}.svg",
+                bbox_inches="tight",
+                facecolor=background_rgba,
+            )
+            figure.savefig(
+                plot_directory / f"{name}.pdf",
+                bbox_inches="tight",
+                facecolor=background_rgba,
+            )
+            pdf.savefig(figure, bbox_inches="tight", facecolor=background_rgba)
+            plt.close(figure)
+        if statistics_result:
+            statistical_lines = statistical_methods_markdown(
+                result, statistics_result
+            ).splitlines()
+            for title, key in (
+                ("Cluster composition", "composition_summary"),
+                ("Composition omnibus tests", "composition_omnibus"),
+                ("Agresti-Caffo comparisons", "agresti_caffo"),
+                ("Unit cluster fractions", "unit_composition"),
+                ("Unit permutation tests", "unit_permutation"),
+                ("Metric descriptives", "metric_descriptives"),
+                ("Metric comparisons", "metric_comparisons"),
+                ("Protein-presence comparisons", "protein_presence_comparisons"),
+                ("Protein-presence unit permutations", "protein_presence_unit_permutation"),
+            ):
+                statistical_lines.extend(("", f"## {title}", ""))
+                rows = list(statistics_result.get(key, []))
+                if not rows:
+                    statistical_lines.append("No rows.")
+                    continue
+                for row in rows:
+                    statistical_lines.extend(
+                        textwrap.wrap(
+                            json.dumps(
+                                row,
+                                ensure_ascii=False,
+                                sort_keys=False,
+                                separators=(", ", ": "),
+                            ),
+                            width=150,
+                            subsequent_indent="  ",
+                        )
+                    )
+            lines_per_page = 48
+            for page_index in range(
+                0, len(statistical_lines), lines_per_page
+            ):
+                page = plt.figure(figsize=(11.69, 8.27))
+                page.patch.set_facecolor(background_rgba)
+                page.text(
+                    0.025,
+                    0.975,
+                    "\n".join(
+                        statistical_lines[
+                            page_index : page_index + lines_per_page
+                        ]
+                    ),
+                    ha="left",
+                    va="top",
+                    family="monospace",
+                    fontsize=6.5,
+                    color=axes_rgba,
+                )
+                pdf.savefig(page, bbox_inches="tight", facecolor=background_rgba)
+                plt.close(page)
+    methods_path = path.with_name(f"{path.stem}_statistical_methods.md")
+    methods_path.write_text(
+        statistical_methods_markdown(result, statistics_result or None),
+        encoding="utf-8",
+    )
+    return {
+        "workbook": str(path),
+        "csv_directory": str(csv_directory),
+        "plot_directory": str(plot_directory),
+        "report_pdf": str(pdf_path),
+        "statistical_methods": str(methods_path),
+        "verified": True,
+    }
 
 
 def load_morphology_rows_from_workbook(path: str | Path) -> list[dict[str, object]]:

@@ -366,6 +366,36 @@ def load_measurement_result(
         return json.load(stream)
 
 
+def synchronize_measurement_labels(
+    manifest: dict[str, object], specimen_index: int
+) -> bool:
+    """Update cached table labels after a specimen is regrouped or renamed."""
+
+    path = measurement_result_path(manifest, specimen_index)
+    if not path.is_file():
+        return False
+    result = load_measurement_result(manifest, specimen_index)
+    specimen = manifest["specimens"][specimen_index]
+    group = str(specimen["experimental_group"])
+    specimen_id = str(specimen["specimen_id"])
+    changed = False
+    for key, value in result.items():
+        if not key.endswith("_rows") or not isinstance(value, list):
+            continue
+        for row in value:
+            if not isinstance(row, dict):
+                continue
+            if "experimental_group" in row and row.get("experimental_group") != group:
+                row["experimental_group"] = group
+                changed = True
+            if "specimen_id" in row and row.get("specimen_id") != specimen_id:
+                row["specimen_id"] = specimen_id
+                changed = True
+    if changed:
+        _write_result(path, result)
+    return changed
+
+
 def recover_compatible_measurement_checkpoints(
     manifest: dict[str, object],
 ) -> list[int]:
@@ -1507,7 +1537,7 @@ def load_distribution_preview(
         source = channel_source_path(manifest, specimen["channels"][channel])
         projection = np.zeros(spine.shape[1:], dtype=np.uint16)
         try:
-            stack = np.squeeze(tifffile.memmap(source))
+            stack = np.squeeze(tifffile.memmap(source, mode="r"))
         except ValueError:
             # Compressed TIFFs cannot be mapped directly; tifffile decodes them
             # into a temporary disk-backed array instead of consuming stack RAM.
@@ -1630,7 +1660,7 @@ def load_spine_review_preview(
         channel = role_channels[role]
         source = channel_source_path(manifest, specimen["channels"][channel])
         try:
-            stack = np.squeeze(tifffile.memmap(source))
+            stack = np.squeeze(tifffile.memmap(source, mode="r"))
         except ValueError:
             stack = np.squeeze(tifffile.imread(source, out="memmap"))
         cropped = (
@@ -2193,7 +2223,7 @@ def load_morphology_preview(
     for role in ("dendrite_spines", "protein_clusters"):
         source = channel_source_path(manifest, specimen["channels"][role_channels[role]])
         try:
-            stack = np.squeeze(tifffile.memmap(source))
+            stack = np.squeeze(tifffile.memmap(source, mode="r"))
         except ValueError:
             stack = np.squeeze(tifffile.imread(source, out="memmap"))
         stacks[role] = (

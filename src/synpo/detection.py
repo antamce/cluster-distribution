@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import shutil
@@ -985,6 +986,345 @@ def detect_specimen(
         raise
 
 
+def redetect_specimen_clusters(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    specimen_index: int,
+    settings: DetectionSettings,
+    *,
+    progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+) -> DetectionSummary:
+    """Replace only protein-cluster labels while retaining spine review masks.
+
+    Cluster labels are built in a staging group.  The prior labels, detection
+    metadata, and compatible review signature remain active until the new volume
+    is complete and the project checkpoint can be saved.
+    """
+
+    started = time.monotonic()
+    settings.validate()
+    specimen = manifest["specimens"][specimen_index]
+    preprocessing = specimen["checkpoints"]["preprocessing"]
+    if preprocessing.get("state") != "complete":
+        raise ValueError(
+            f"{specimen['specimen_id']} must finish preprocessing before cluster detection."
+        )
+
+    _, cluster_channel = _role_channels(manifest)
+    preprocessing_root = zarr.open_group(str(project_cache_path(manifest)), mode="r")
+    cluster_key = preprocessing["channels"][cluster_channel]["dataset_key"]
+    cluster_data = preprocessing_root[cluster_key]
+    shape = tuple(int(value) for value in cluster_data.shape)
+
+    detection_root = zarr.open_group(str(detection_cache_path(manifest)), mode="a")
+    group_key = f"specimens/{specimen_index:04d}"
+    if group_key not in detection_root:
+        raise ValueError(
+            "Full dendrite/spine detection must finish before clusters can be refreshed alone."
+        )
+    group = detection_root[group_key]
+    if not bool(group.attrs.get("complete", False)) or "cluster_labels" not in group:
+        raise ValueError(
+            "Full dendrite/spine detection must finish before clusters can be refreshed alone."
+        )
+    if tuple(int(value) for value in group["cluster_labels"].shape) != shape:
+        raise ValueError("The prior detection and refreshed cluster channel shapes differ.")
+
+    stored_settings = group.attrs.get("settings")
+    if isinstance(stored_settings, dict):
+        applied = DetectionSettings.from_dict(stored_settings)
+        settings = DetectionSettings(
+            dendrite_sensitivity=applied.dendrite_sensitivity,
+            cluster_sensitivity=settings.cluster_sensitivity,
+            spine_branch_length_um=applied.spine_branch_length_um,
+            minimum_dendrite_length_um=applied.minimum_dendrite_length_um,
+            minimum_spine_projection_pixels=applied.minimum_spine_projection_pixels,
+            minimum_cluster_voxels=settings.minimum_cluster_voxels,
+        )
+        settings.validate()
+
+    old_signature = str(group.attrs.get("settings_signature", ""))
+    review_path = project_cache_path(manifest).parent / "review.zarr"
+    review_group: zarr.Group | None = None
+    if review_path.exists():
+        review_root = zarr.open_group(str(review_path), mode="a")
+        if group_key in review_root:
+            candidate = review_root[group_key]
+            if bool(candidate.attrs.get("initialized", False)):
+                if str(candidate.attrs.get("detection_signature", "")) != old_signature:
+                    raise ValueError(
+                        "The saved manual corrections do not match the active detection. "
+                        "Resolve that mismatch before refreshing clusters."
+                    )
+                review_group = candidate
+
+    maximum_ram_fraction = min(
+        0.8, float(manifest["resource_policy"].get("maximum_ram_fraction", 0.8))
+    )
+    requested_mode = _memory_mode(manifest)
+    use_low_memory = requested_mode == ALWAYS_LOW_MEMORY_MODE or not (
+        _standard_detection_fits(shape, maximum_ram_fraction)
+    )
+    processing_mode = "low_memory" if use_low_memory else "standard"
+    if use_low_memory:
+        _preflight_low_memory_disk(detection_cache_path(manifest).parent, shape)
+
+    staging_name = "_cluster_refresh"
+    backup_name = "_cluster_labels_previous"
+    if backup_name in group:
+        if "cluster_labels" not in group:
+            group.move(backup_name, "cluster_labels")
+        else:
+            del group[backup_name]
+    if staging_name in group:
+        del group[staging_name]
+    staging = group.require_group(staging_name)
+
+    try:
+        if use_low_memory:
+            cluster_result = _detect_clusters_low_memory(
+                cluster_data,
+                staging,
+                settings,
+                maximum_ram_fraction=maximum_ram_fraction,
+                progress=progress,
+                progress_offset=0,
+                progress_total=shape[0],
+                cancel_event=cancel_event,
+            )
+        else:
+            cluster_result = _detect_clusters(
+                cluster_data,
+                staging,
+                settings,
+                progress=progress,
+                progress_offset=0,
+                progress_total=shape[0],
+                cancel_event=cancel_event,
+            )
+        _cancel_if_requested(cancel_event)
+        cluster_count, flagged_clusters, _, _, _ = cluster_result
+
+        prior_summary = dict(group.attrs.get("summary", {}))
+        summary = DetectionSummary(
+            specimen_index=specimen_index,
+            dendrite_count=int(prior_summary.get("dendrite_count", 0)),
+            spine_count=int(prior_summary.get("spine_count", 0)),
+            cluster_count=int(cluster_count),
+            flagged_spine_count=int(prior_summary.get("flagged_spine_count", 0)),
+            flagged_cluster_count=len(flagged_clusters),
+            elapsed_seconds=time.monotonic() - started,
+            processing_mode=processing_mode,
+        )
+        new_signature = detection_signature(manifest, specimen_index, settings)
+
+        old_group_attrs = dict(group.attrs)
+        old_review_attrs = dict(review_group.attrs) if review_group is not None else None
+        old_specimen = copy.deepcopy(specimen)
+        had_morphology_analysis = "morphology_analysis" in manifest
+        old_morphology_analysis = copy.deepcopy(manifest.get("morphology_analysis"))
+        backed_up = False
+        swapped = False
+        try:
+            group.move("cluster_labels", backup_name)
+            backed_up = True
+            group.move(f"{staging_name}/cluster_labels", "cluster_labels")
+            swapped = True
+            group.attrs.update(
+                {
+                    "complete": True,
+                    "completed_at": time.time(),
+                    "settings_signature": new_signature,
+                    "settings": settings.to_dict(),
+                    "processing_mode": processing_mode,
+                    "summary": summary.to_dict(),
+                    "flagged_cluster_ids": flagged_clusters,
+                }
+            )
+            if review_group is not None:
+                review_group.attrs.update(
+                    {
+                        "detection_signature": new_signature,
+                        "cluster_count": int(cluster_count),
+                    }
+                )
+
+            detection_checkpoint = specimen["checkpoints"]["detection"]
+            detection_checkpoint.update(
+                {
+                    "state": "complete",
+                    "updated_at": time.time(),
+                    "settings_signature": new_signature,
+                    "cache_path": str(detection_cache_path(manifest)),
+                    "summary": summary.to_dict(),
+                    "processing_mode": processing_mode,
+                }
+            )
+            for stale_key in (
+                "reason",
+                "required_bytes",
+                "free_bytes",
+                "error_type",
+                "cluster_refresh_required",
+            ):
+                detection_checkpoint.pop(stale_key, None)
+            review_checkpoint = specimen["checkpoints"].setdefault("review", {})
+            if review_checkpoint.get("detection_signature") in {None, old_signature}:
+                review_checkpoint["detection_signature"] = new_signature
+            specimen["checkpoints"].setdefault("measurements", {}).update(
+                {"state": "not_started", "updated_at": time.time()}
+            )
+            for run in manifest.get("morphology_analysis", {}).get("runs", []):
+                run["stale"] = True
+            save_project(project_path, manifest)
+        except Exception:
+            if swapped:
+                if "cluster_labels" in group:
+                    del group["cluster_labels"]
+            if backed_up and backup_name in group and "cluster_labels" not in group:
+                group.move(backup_name, "cluster_labels")
+            group.attrs.put(old_group_attrs)
+            if review_group is not None and old_review_attrs is not None:
+                review_group.attrs.put(old_review_attrs)
+            specimen.clear()
+            specimen.update(old_specimen)
+            if had_morphology_analysis:
+                manifest["morphology_analysis"] = old_morphology_analysis
+            else:
+                manifest.pop("morphology_analysis", None)
+            raise
+
+        if backup_name in group:
+            try:
+                del group[backup_name]
+            except Exception:
+                # The committed labels and project checkpoint are already valid.
+                # A leftover backup is recovered/removed at the next refresh.
+                pass
+        return summary
+    finally:
+        if staging_name in group:
+            try:
+                del group[staging_name]
+            except Exception:
+                # Staging data are never consulted by readers or checkpoints.
+                pass
+
+
+def redetect_project_clusters(
+    manifest: dict[str, object],
+    project_path: str | Path,
+    *,
+    progress: ProgressCallback | None = None,
+    pair_completed: Callable[[int, dict[str, object]], None] | None = None,
+    cancel_event: Event | None = None,
+    specimen_indices: list[int] | None = None,
+) -> dict[str, object]:
+    """Refresh protein clusters without changing dendrite/spine detection or review."""
+
+    specimens = manifest["specimens"]
+    selected = (
+        set(range(len(specimens)))
+        if specimen_indices is None
+        else {int(value) for value in specimen_indices}
+    )
+    eligible = [
+        index
+        for index, specimen in enumerate(specimens)
+        if index in selected
+        and not bool(specimen.get("analysis", {}).get("excluded", False))
+        and specimen["checkpoints"]["preprocessing"].get("state") == "complete"
+        and specimen["checkpoints"]["detection"].get("state") == "complete"
+    ]
+    if not eligible:
+        raise ValueError(
+            "No selected specimen has both complete preprocessing and an existing detection."
+        )
+
+    _, cluster_channel = _role_channels(manifest)
+    work_units: dict[int, int] = {}
+    for index in eligible:
+        shape = specimens[index]["channels"][cluster_channel]["metadata"]["shape"]
+        work_units[index] = 1 if len(shape) == 2 else int(shape[0])
+    total_work = sum(work_units.values())
+    completed_work = 0
+    completed_pairs = 0
+    low_memory_pairs = 0
+    skipped_pairs = 0
+    failed_pairs = 0
+    summaries: list[dict[str, object]] = []
+    started = time.monotonic()
+
+    for specimen_index in eligible:
+        _cancel_if_requested(cancel_event)
+        specimen = specimens[specimen_index]
+        settings = effective_detection_settings(manifest, specimen_index)
+
+        def specimen_progress(phase: str, current: int, total: int, detail: str) -> None:
+            if progress:
+                progress(
+                    phase,
+                    completed_work + current,
+                    total_work,
+                    f"{specimen['specimen_id']}: {detail}",
+                )
+
+        try:
+            summary = redetect_specimen_clusters(
+                manifest,
+                project_path,
+                specimen_index,
+                settings,
+                progress=specimen_progress,
+                cancel_event=cancel_event,
+            )
+        except ProcessingCancelled:
+            raise
+        except InsufficientDetectionDiskSpace as exc:
+            outcome = {
+                "outcome": "skipped",
+                "clusters_only": True,
+                "specimen_index": specimen_index,
+                "reason": str(exc),
+                "required_bytes": exc.required_bytes,
+                "free_bytes": exc.free_bytes,
+            }
+            skipped_pairs += 1
+        except Exception as exc:
+            outcome = {
+                "outcome": "failed",
+                "clusters_only": True,
+                "specimen_index": specimen_index,
+                "reason": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            failed_pairs += 1
+        else:
+            outcome = summary.to_dict()
+            outcome.update(
+                {"outcome": "complete", "clusters_only": True, "reused": False}
+            )
+            completed_pairs += 1
+            low_memory_pairs += int(summary.processing_mode == "low_memory")
+
+        summaries.append(outcome)
+        completed_work += work_units[specimen_index]
+        if pair_completed:
+            pair_completed(specimen_index, outcome)
+
+    return {
+        "elapsed_seconds": time.monotonic() - started,
+        "completed_pairs": completed_pairs,
+        "reused_pairs": 0,
+        "low_memory_pairs": low_memory_pairs,
+        "skipped_pairs": skipped_pairs,
+        "failed_pairs": failed_pairs,
+        "summaries": summaries,
+        "clusters_only": True,
+    }
+
+
 def detect_project(
     manifest: dict[str, object],
     project_path: str | Path,
@@ -1148,7 +1488,13 @@ def detect_project(
                 "processing_mode": summary.processing_mode,
             }
         )
-        for stale_key in ("reason", "required_bytes", "free_bytes", "error_type"):
+        for stale_key in (
+            "reason",
+            "required_bytes",
+            "free_bytes",
+            "error_type",
+            "cluster_refresh_required",
+        ):
             checkpoint.pop(stale_key, None)
         if not summary.skipped:
             specimen["checkpoints"].setdefault("measurements", {}).update(

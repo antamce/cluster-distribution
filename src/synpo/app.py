@@ -48,6 +48,11 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from . import __version__
+from .clustering_statistics import (
+    ClusteringStatisticsSettings,
+    calculate_clustering_statistics,
+    draw_cluster_statistics,
+)
 from .calibration import CalibrationStore
 from .importer import inspect_manual_pair, scan_batch
 from .models import Calibration, ScanReport, SpecimenPair
@@ -85,6 +90,7 @@ from .detection import (
     detect_project,
     effective_detection_settings,
     load_detection_slice,
+    redetect_project_clusters,
 )
 from .diagnostics import (
     DIAGNOSTIC_LEVEL_CORRECTION,
@@ -136,6 +142,7 @@ from .measurements import (
     set_distribution_review,
     set_spine_quality_review,
     spine_volume_filter_settings,
+    synchronize_measurement_labels,
     redo_morphology_review,
     undo_morphology_review,
 )
@@ -147,7 +154,9 @@ from .exporting import (
 from .morphology import (
     DEFAULT_FEATURES,
     DEFAULT_PLOT_STYLE,
+    INCLUSIVE_CLUSTERING_FEATURES,
     MORPHOLOGY_FEATURES,
+    STANDARD_MORPHOLOGY_FEATURES,
     MorphologyClusteringSettings,
     draw_pca_3d_feature_axes,
     draw_pca_interpretation,
@@ -161,6 +170,32 @@ from .morphology import (
     save_named_morphology_run,
     update_run_colors,
     update_run_plot_style,
+    update_run_statistics,
+)
+from .calcium import (
+    assign_manual_match,
+    automatic_match_spines,
+    calcium_analysis_rows,
+    calcium_cluster_statistics,
+    calcium_reference_image_path,
+    calcium_spine_in_review_scope,
+    draw_calcium_dependency,
+    export_calcium_analysis,
+    ignore_all_unmatched,
+    import_calcium_results,
+    invalidate_calcium_matches_for_specimen,
+    load_calcium_dataset,
+    relink_calcium_source,
+    remove_registration,
+    review_all_proposed,
+    save_calcium_dataset,
+    set_match_review,
+    synpo_matching_scene,
+    transform_points,
+    update_calcium_field_coverage,
+    update_calcium_field_coverage_from_manifest,
+    upsert_calcium_analysis_run,
+    upsert_registration,
 )
 
 
@@ -263,6 +298,110 @@ def _screen_limited_size(widget: QWidget, width: int, height: int) -> tuple[int,
     )
 
 
+class CalciumFolderImportDialog(QDialog):
+    """Collect one or more calcium experiment folders for a batch import."""
+
+    def __init__(self, parent=None) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self.setWindowTitle("Add calcium-imaging experiments")
+        self.resize(*_screen_limited_size(self, 720, 430))
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Add each calcium-imaging results folder used by this Synpo project. "
+            "Each folder remains a separate named experiment for registration and "
+            "match review; advanced clustering can combine all imported experiments."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.folder_list = QListWidget()
+        self.folder_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        layout.addWidget(self.folder_list, 1)
+        controls = QHBoxLayout()
+        add_button = QPushButton("Add folder…")
+        add_button.clicked.connect(self._add_folder)
+        controls.addWidget(add_button)
+        remove_button = QPushButton("Remove selected")
+        remove_button.clicked.connect(self._remove_selected)
+        controls.addWidget(remove_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _add_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self, "Select a calcium-imaging results folder", ""
+        )
+        if not selected:
+            return
+        resolved = str(Path(selected).resolve())
+        existing = {
+            self.folder_list.item(index).text().casefold()
+            for index in range(self.folder_list.count())
+        }
+        if resolved.casefold() not in existing:
+            self.folder_list.addItem(resolved)
+
+    def _remove_selected(self) -> None:
+        rows = sorted(
+            {self.folder_list.row(item) for item in self.folder_list.selectedItems()},
+            reverse=True,
+        )
+        for row in rows:
+            self.folder_list.takeItem(row)
+
+    def folders(self) -> tuple[Path, ...]:
+        return tuple(
+            Path(self.folder_list.item(index).text())
+            for index in range(self.folder_list.count())
+        )
+
+
+def _tone_adjusted_image(
+    source: QImage,
+    brightness: int = 0,
+    contrast_percent: int = 100,
+    auto_levels: bool = False,
+) -> QImage:
+    """Return an RGB display copy with non-destructive tone adjustments."""
+
+    image = source.convertToFormat(QImage.Format.Format_RGB888)
+    buffer = image.bits()
+    rgb = (
+        np.frombuffer(buffer, dtype=np.uint8)
+        .reshape(image.height(), image.bytesPerLine())[:, : image.width() * 3]
+        .reshape(image.height(), image.width(), 3)
+        .astype(np.float32)
+    )
+    if auto_levels and rgb.size:
+        intensity = np.max(rgb, axis=2)
+        low, high = np.percentile(intensity, (0.5, 99.8))
+        if float(high) - float(low) < 1.0:
+            low, high = float(np.min(intensity)), float(np.max(intensity))
+        if float(high) - float(low) >= 1.0:
+            rgb = (rgb - float(low)) * (255.0 / (float(high) - float(low)))
+    contrast = max(0.1, float(contrast_percent) / 100.0)
+    offset = float(brightness) * 2.55
+    rgb = np.clip((rgb - 127.5) * contrast + 127.5 + offset, 0, 255).astype(
+        np.uint8
+    )
+    result = np.ascontiguousarray(rgb)
+    return QImage(
+        result.data,
+        result.shape[1],
+        result.shape[0],
+        result.strides[0],
+        QImage.Format.Format_RGB888,
+    ).copy()
+
+
 class AbsoluteSlider(QSlider):
     """A slider whose mouse click maps directly to the clicked value."""
 
@@ -290,14 +429,37 @@ class SliceView(QLabel):
         super().__init__(placeholder)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(240, 200)
+        # QLabel derives its size hint from the current pixmap. Inside a
+        # widget-resizable scroll area that creates a resize -> repaint -> new
+        # pixmap -> resize feedback loop and can overflow the Windows Qt stack.
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+        )
         self.setStyleSheet("background: #171717; color: #bdbdbd; border: 1px solid #444;")
         self._image: QImage | None = None
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
         self._panning = False
+        self._pan_mode = False
+        self._pan_button: Qt.MouseButton | None = None
         self._last_pan_position: QPointF | None = None
         self._cursor_before_pan = self.cursor()
+        self._cursor_before_pan_mode = self.cursor()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_pan_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._pan_mode:
+            return
+        self._pan_mode = enabled
+        if enabled:
+            self._cursor_before_pan_mode = self.cursor()
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self._panning = False
+            self._pan_button = None
+            self._last_pan_position = None
+            self.setCursor(self._cursor_before_pan_mode)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down}:
@@ -409,6 +571,48 @@ class SliceView(QLabel):
         ).copy()
         self._render()
 
+    def show_placeholder(self, text: str) -> None:
+        self._image = None
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.clear()
+        self.setText(text)
+
+    def focus_on_image_points(
+        self,
+        points_xy: list[tuple[float, float]],
+        *,
+        minimum_extent: float = 100.0,
+    ) -> None:
+        if self._image is None or not points_xy:
+            return
+        xs = [
+            min(max(float(point[0]), 0.0), float(self._image.width() - 1))
+            for point in points_xy
+        ]
+        ys = [
+            min(max(float(point[1]), 0.0), float(self._image.height() - 1))
+            for point in points_xy
+        ]
+        center_x = (min(xs) + max(xs)) / 2.0
+        center_y = (min(ys) + max(ys)) / 2.0
+        extent_x = max(float(minimum_extent), (max(xs) - min(xs) + 1.0) * 4.0)
+        extent_y = max(float(minimum_extent), (max(ys) - min(ys) + 1.0) * 4.0)
+        display_scale = min(
+            max(1, self.width()) / extent_x,
+            max(1, self.height()) / extent_y,
+        )
+        self._zoom = max(
+            0.05,
+            min(40.0, display_scale / max(1e-9, self._fit_scale())),
+        )
+        actual_scale = self._display_scale()
+        self._pan = QPointF(
+            (self._image.width() / 2.0 - center_x) * actual_scale,
+            (self._image.height() / 2.0 - center_y) * actual_scale,
+        )
+        self._render()
+
     def show_detection(
         self,
         array: np.ndarray,
@@ -495,8 +699,15 @@ class SliceView(QLabel):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if event.button() == Qt.MouseButton.MiddleButton:
+        if self._image is not None and (
+            event.button() == Qt.MouseButton.MiddleButton
+            or (
+                self._pan_mode
+                and event.button() == Qt.MouseButton.LeftButton
+            )
+        ):
             self._panning = True
+            self._pan_button = event.button()
             self._last_pan_position = event.position()
             self._cursor_before_pan = self.cursor()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -515,13 +726,694 @@ class SliceView(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self._panning and event.button() == Qt.MouseButton.MiddleButton:
+        if self._panning and event.button() == self._pan_button:
             self._panning = False
+            self._pan_button = None
             self._last_pan_position = None
-            self.setCursor(self._cursor_before_pan)
+            self.setCursor(
+                Qt.CursorShape.OpenHandCursor
+                if self._pan_mode
+                else self._cursor_before_pan
+            )
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+
+class CalciumRegistrationView(SliceView):
+    """Clickable registration image with ROI outlines and numbered landmarks."""
+
+    point_clicked = Signal(float, float)
+    view_state_changed = Signal(float, float, float)
+
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self._landmarks: list[tuple[float, float]] = []
+        self._calcium_source_path: Path | None = None
+        self._calcium_source_image: QImage | None = None
+        self._calcium_recording: dict[str, object] | None = None
+        self._calcium_brightness = 0
+        self._calcium_contrast = 100
+        self._calcium_auto_levels = False
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def set_landmarks(self, points_xy: list[tuple[float, float]]) -> None:
+        self._landmarks = list(points_xy)
+        self._render()
+
+    def set_calcium_scene(
+        self, image_path: Path, recording: dict[str, object]
+    ) -> None:
+        resolved = image_path.resolve()
+        if self._calcium_source_image is None or self._calcium_source_path != resolved:
+            source = QImage(str(resolved))
+            if source.isNull():
+                raise ValueError(f"Cannot open calcium reference image: {image_path}")
+            self._calcium_source_path = resolved
+            self._calcium_source_image = source
+        self._calcium_recording = recording
+        self._draw_calcium_scene(reset_view=True)
+
+    def set_calcium_tone_adjustments(
+        self, brightness: int, contrast_percent: int, auto_levels: bool
+    ) -> None:
+        self._calcium_brightness = int(brightness)
+        self._calcium_contrast = int(contrast_percent)
+        self._calcium_auto_levels = bool(auto_levels)
+        if self._calcium_source_image is not None and self._calcium_recording is not None:
+            self._draw_calcium_scene(reset_view=False)
+
+    def _draw_calcium_scene(self, *, reset_view: bool) -> None:
+        if self._calcium_source_image is None or self._calcium_recording is None:
+            return
+        image = _tone_adjusted_image(
+            self._calcium_source_image,
+            self._calcium_brightness,
+            self._calcium_contrast,
+            self._calcium_auto_levels,
+        )
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(QPen(QColor(40, 220, 230, 150), 1))
+        for roi in self._calcium_recording.get("dendrite_segments", {}).values():
+            points = [
+                QPoint(round(float(point[0])), round(float(point[1])))
+                for point in roi.get("points_xy", [])
+            ]
+            if len(points) >= 2:
+                painter.drawPolyline(QPolygon(points))
+        painter.setPen(QPen(QColor(255, 65, 205, 220), 2))
+        for spine in self._calcium_recording.get("spines", []):
+            points = [
+                QPoint(round(float(point[0])), round(float(point[1])))
+                for point in spine.get("roi", {}).get("points_xy", [])
+            ]
+            if len(points) >= 2:
+                painter.drawPolygon(QPolygon(points))
+            center = spine.get("center_xy", (0, 0))
+            painter.drawText(
+                QPoint(round(float(center[0])) + 3, round(float(center[1])) - 3),
+                str(spine.get("spine_roi", "")),
+            )
+        painter.end()
+        self._image = image
+        if reset_view:
+            self.reset_view()
+        else:
+            self._render()
+            self.zoom_changed.emit(self.zoom_percent())
+
+    def set_synpo_scene(self, scene: dict[str, object]) -> None:
+        self._calcium_recording = None
+        raw = np.asarray(scene["raw_projection"], dtype=np.float32)
+        low, high = np.percentile(raw, (0.5, 99.8))
+        scale = max(1.0, float(high) - float(low))
+        gray = np.clip((raw - float(low)) * 255.0 / scale, 0, 255).astype(
+            np.uint8
+        )
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        dendrites = np.asarray(scene["dendrite_projection"], dtype=np.uint32)
+        spines = np.asarray(scene["spine_projection"], dtype=np.uint32)
+        dendrite_edge = SpineMapView._boundaries(dendrites)
+        spine_edge = SpineMapView._boundaries(spines)
+        rgb[dendrite_edge] = (35, 225, 100)
+        rgb[spine_edge] = (255, 70, 205)
+        image = QImage(
+            rgb.data,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.strides[0],
+            QImage.Format.Format_RGB888,
+        ).copy()
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#fff36a"), 1))
+        for spine in scene.get("spines", []):
+            center = spine.get("center_xy", (0, 0))
+            painter.drawText(
+                QPoint(round(float(center[0])) + 3, round(float(center[1])) - 3),
+                str(spine.get("spine_id", "")),
+            )
+        painter.end()
+        self._image = image
+        self.reset_view()
+
+    def set_linked_view(self, zoom: float, pan_x: float, pan_y: float) -> None:
+        self._zoom = max(0.05, min(40.0, float(zoom)))
+        self._pan = QPointF(float(pan_x), float(pan_y))
+        self._render()
+
+    def _render(self) -> None:
+        super()._render()
+        pixmap = self.pixmap()
+        if self._image is None or pixmap is None:
+            return
+        canvas = pixmap.copy()
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        target = self._target_rect()
+        sx = target.width() / max(1, self._image.width())
+        sy = target.height() / max(1, self._image.height())
+        for index, (x, y) in enumerate(self._landmarks, start=1):
+            display = QPointF(target.left() + x * sx, target.top() + y * sy)
+            painter.setPen(QPen(QColor("#fff000"), 3))
+            painter.drawEllipse(display, 6, 6)
+            painter.drawText(display + QPointF(8, -8), str(index))
+        painter.end()
+        self.setPixmap(canvas)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._pan_mode:
+            super().mousePressEvent(event)
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            coordinate = self.image_coordinate(event.position())
+            if coordinate is not None:
+                self.point_clicked.emit(float(coordinate[0]), float(coordinate[1]))
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        panning = self._panning
+        super().mouseMoveEvent(event)
+        if panning:
+            self.view_state_changed.emit(self._zoom, self._pan.x(), self._pan.y())
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().wheelEvent(event)
+        self.view_state_changed.emit(self._zoom, self._pan.x(), self._pan.y())
+
+
+class CalciumMatchReviewView(SliceView):
+    """Focused calcium/Synpo match view with transformed ROI overlays."""
+
+    spine_clicked = Signal(int)
+
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(placeholder)
+        self._calcium_base_path: Path | None = None
+        self._calcium_base_image: QImage | None = None
+        self._calcium_scene_recording: dict[str, object] | None = None
+        self._calcium_scene_spine: dict[str, object] | None = None
+        self._calcium_brightness = 0
+        self._calcium_contrast = 100
+        self._calcium_auto_levels = False
+        self._synpo_scene_source: dict[str, object] | None = None
+        self._synpo_base_image: QImage | None = None
+        self._clickable_spine_projection: np.ndarray | None = None
+        self._persistent_synpo_calcium_overlay: dict[str, object] | None = None
+
+    @staticmethod
+    def _points(value: object) -> list[tuple[float, float]]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        points: list[tuple[float, float]] = []
+        for point in value:
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                points.append((float(point[0]), float(point[1])))
+        return points
+
+    @staticmethod
+    def _draw_polygon(
+        painter: QPainter,
+        points_xy: list[tuple[float, float]],
+        color: QColor,
+        width: int,
+        fill: QColor | None = None,
+    ) -> None:
+        points = QPolygon(
+            [QPoint(round(point[0]), round(point[1])) for point in points_xy]
+        )
+        if len(points) < 2:
+            return
+        painter.setPen(QPen(color, width))
+        painter.setBrush(fill if fill is not None else Qt.BrushStyle.NoBrush)
+        painter.drawPolygon(points)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    @classmethod
+    def _draw_emphasized_polygon(
+        cls,
+        painter: QPainter,
+        points_xy: list[tuple[float, float]],
+        color: QColor,
+        width: int,
+        fill: QColor,
+    ) -> None:
+        cls._draw_polygon(
+            painter,
+            points_xy,
+            QColor(0, 0, 0, 235),
+            width + 4,
+        )
+        cls._draw_polygon(painter, points_xy, color, width, fill)
+
+    @staticmethod
+    def _highlight_label_boundary(
+        rgb: np.ndarray,
+        labels: np.ndarray,
+        label: int,
+        color: tuple[int, int, int],
+        thickness: int = 1,
+    ) -> None:
+        positions = np.argwhere(labels == int(label))
+        if not len(positions):
+            return
+        padding = max(1, int(thickness))
+        y0, x0 = np.maximum(positions.min(axis=0) - padding, 0)
+        y1, x1 = np.minimum(positions.max(axis=0) + padding + 1, labels.shape)
+        local = labels[int(y0) : int(y1), int(x0) : int(x1)] == int(label)
+        edge = SpineMapView._boundaries(local.astype(np.uint8))
+        if thickness > 1:
+            edge = ndimage.binary_dilation(edge, iterations=int(thickness) - 1)
+        target = rgb[int(y0) : int(y1), int(x0) : int(x1)]
+        target[edge] = color
+
+    def _calcium_background(self, image_path: Path) -> QImage:
+        resolved = image_path.resolve()
+        if (
+            self._calcium_base_image is None
+            or self._calcium_base_path != resolved
+        ):
+            image = QImage(str(resolved))
+            if image.isNull():
+                raise ValueError(f"Cannot open calcium reference image: {image_path}")
+            self._calcium_base_path = resolved
+            self._calcium_base_image = image.convertToFormat(
+                QImage.Format.Format_RGB888
+            )
+        return _tone_adjusted_image(
+            self._calcium_base_image,
+            self._calcium_brightness,
+            self._calcium_contrast,
+            self._calcium_auto_levels,
+        )
+
+    def _synpo_background(self, scene: dict[str, object]) -> QImage:
+        if self._synpo_base_image is None or self._synpo_scene_source is not scene:
+            raw = np.asarray(scene["raw_projection"], dtype=np.float32)
+            low, high = np.percentile(raw, (0.5, 99.8))
+            scale = max(1.0, float(high) - float(low))
+            gray = np.clip((raw - float(low)) * 255.0 / scale, 0, 255).astype(
+                np.uint8
+            )
+            rgb = np.repeat(gray[:, :, None], 3, axis=2)
+            dendrites = np.asarray(scene["dendrite_projection"], dtype=np.uint32)
+            spines = np.asarray(scene["spine_projection"], dtype=np.uint32)
+            dendrite_edges = SpineMapView._boundaries(dendrites)
+            spine_edges = SpineMapView._boundaries(spines)
+            overview_width = max(
+                1,
+                min(4, round(max(raw.shape) / 1500)),
+            )
+            if overview_width > 1:
+                spine_edges = ndimage.binary_dilation(
+                    spine_edges, iterations=overview_width - 1
+                )
+            rgb[dendrite_edges] = (30, 150, 80)
+            rgb[spine_edges] = (225, 65, 200)
+            self._synpo_base_image = QImage(
+                rgb.data,
+                rgb.shape[1],
+                rgb.shape[0],
+                rgb.strides[0],
+                QImage.Format.Format_RGB888,
+            ).copy()
+            self._synpo_scene_source = scene
+        return self._synpo_base_image.copy()
+
+    def set_calcium_match_scene(
+        self,
+        image_path: Path,
+        recording: dict[str, object],
+        selected_spine: dict[str, object],
+        *,
+        reset_view: bool = True,
+    ) -> None:
+        self._clickable_spine_projection = None
+        self._persistent_synpo_calcium_overlay = None
+        self._calcium_scene_recording = recording
+        self._calcium_scene_spine = selected_spine
+        image = self._calcium_background(image_path)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        selected_width = max(6, min(28, round(max(image.width(), image.height()) / 350)))
+        parent_width = max(5, selected_width - 2)
+        for spine in recording.get("spines", []):
+            self._draw_polygon(
+                painter,
+                self._points(dict(spine.get("roi", {})).get("points_xy", [])),
+                QColor(255, 80, 215, 125),
+                max(2, selected_width // 3),
+            )
+        parent_name = str(selected_spine.get("parent_segment", ""))
+        parent = dict(recording.get("dendrite_segments", {})).get(parent_name, {})
+        parent_points = self._points(dict(parent).get("points_xy", []))
+        self._draw_emphasized_polygon(
+            painter,
+            parent_points,
+            QColor(20, 245, 255, 255),
+            parent_width,
+            QColor(20, 245, 255, 55),
+        )
+        selected_points = self._points(
+            dict(selected_spine.get("roi", {})).get("points_xy", [])
+        )
+        self._draw_emphasized_polygon(
+            painter,
+            selected_points,
+            QColor(255, 245, 0, 255),
+            selected_width,
+            QColor(255, 245, 0, 95),
+        )
+        center = selected_spine.get("center_xy")
+        if isinstance(center, (list, tuple)) and len(center) == 2:
+            point = QPointF(float(center[0]), float(center[1]))
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawEllipse(point, 5, 5)
+            painter.drawText(
+                point + QPointF(7, -7), str(selected_spine.get("spine_roi", ""))
+            )
+        painter.end()
+        self._image = image
+        if reset_view:
+            self.reset_view()
+            self.focus_on_image_points(selected_points or parent_points)
+        else:
+            self._render()
+            self.zoom_changed.emit(self.zoom_percent())
+
+    def set_calcium_tone_adjustments(
+        self, brightness: int, contrast_percent: int, auto_levels: bool
+    ) -> None:
+        self._calcium_brightness = int(brightness)
+        self._calcium_contrast = int(contrast_percent)
+        self._calcium_auto_levels = bool(auto_levels)
+        if (
+            self._calcium_base_path is not None
+            and self._calcium_scene_recording is not None
+            and self._calcium_scene_spine is not None
+        ):
+            self.set_calcium_match_scene(
+                self._calcium_base_path,
+                self._calcium_scene_recording,
+                self._calcium_scene_spine,
+                reset_view=False,
+            )
+
+    def show_placeholder(self, text: str) -> None:
+        self._clickable_spine_projection = None
+        self._persistent_synpo_calcium_overlay = None
+        self._calcium_scene_recording = None
+        self._calcium_scene_spine = None
+        super().show_placeholder(text)
+
+    def set_synpo_match_scene(
+        self,
+        scene: dict[str, object],
+        registration: dict[str, object],
+        recording: dict[str, object],
+        selected_spine: dict[str, object],
+        match: dict[str, object],
+    ) -> dict[str, object]:
+        self._persistent_synpo_calcium_overlay = None
+        image = self._synpo_background(scene)
+        image_buffer = image.bits()
+        rgb = np.frombuffer(image_buffer, dtype=np.uint8).reshape(
+            image.height(), image.bytesPerLine()
+        )[:, : image.width() * 3].reshape(image.height(), image.width(), 3)
+        dendrites = np.asarray(scene["dendrite_projection"], dtype=np.uint32)
+        spines = np.asarray(scene["spine_projection"], dtype=np.uint32)
+        self._clickable_spine_projection = spines
+        synpo_spine_id = int(match.get("synpo_spine_id") or 0)
+        synpo_dendrite_id = int(match.get("synpo_dendrite_id") or 0)
+        selected_width = max(6, min(28, round(max(image.width(), image.height()) / 350)))
+        parent_width = max(5, selected_width - 2)
+        if synpo_dendrite_id:
+            self._highlight_label_boundary(
+                rgb,
+                dendrites,
+                synpo_dendrite_id,
+                (45, 255, 105),
+                parent_width,
+            )
+        if synpo_spine_id:
+            self._highlight_label_boundary(
+                rgb,
+                spines,
+                synpo_spine_id,
+                (255, 40, 220),
+                selected_width,
+            )
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        def transformed(points: object) -> list[tuple[float, float]]:
+            values = self._points(points)
+            if not values:
+                return []
+            mapped = transform_points(registration, values)
+            return [(float(point[0]), float(point[1])) for point in mapped]
+
+        for roi in dict(recording.get("dendrite_segments", {})).values():
+            self._draw_polygon(
+                painter,
+                transformed(dict(roi).get("points_xy", [])),
+                QColor(35, 225, 240, 65),
+                1,
+            )
+        for spine in recording.get("spines", []):
+            self._draw_polygon(
+                painter,
+                transformed(dict(spine.get("roi", {})).get("points_xy", [])),
+                QColor(255, 235, 45, 65),
+                1,
+            )
+        parent_name = str(selected_spine.get("parent_segment", ""))
+        parent = dict(recording.get("dendrite_segments", {})).get(parent_name, {})
+        parent_points = transformed(dict(parent).get("points_xy", []))
+        calcium_points = transformed(
+            dict(selected_spine.get("roi", {})).get("points_xy", [])
+        )
+        self._persistent_synpo_calcium_overlay = {
+            "spine_points_xy": calcium_points,
+            "parent_points_xy": parent_points,
+        }
+        self._draw_emphasized_polygon(
+            painter,
+            parent_points,
+            QColor(20, 245, 255, 255),
+            parent_width,
+            QColor(20, 245, 255, 45),
+        )
+        self._draw_emphasized_polygon(
+            painter,
+            calcium_points,
+            QColor(255, 245, 0, 255),
+            selected_width,
+            QColor(255, 245, 0, 85),
+        )
+        source_center = selected_spine.get("center_xy")
+        if not isinstance(source_center, (list, tuple)) or len(source_center) != 2:
+            if calcium_points:
+                source_center = (
+                    float(np.mean([point[0] for point in calcium_points])),
+                    float(np.mean([point[1] for point in calcium_points])),
+                )
+            else:
+                source_center = (0.0, 0.0)
+        transformed_center = transform_points(registration, [source_center])[0]
+        target = next(
+            (
+                row
+                for row in scene.get("spines", [])
+                if int(row.get("spine_id") or 0) == synpo_spine_id
+            ),
+            None,
+        )
+        target_value = target.get("center_xy") if target is not None else None
+        target_center = (
+            np.asarray(target_value, dtype=np.float64)
+            if isinstance(target_value, (list, tuple)) and len(target_value) == 2
+            else None
+        )
+        calcium_center_point = QPointF(
+            float(transformed_center[0]), float(transformed_center[1])
+        )
+        painter.setPen(QPen(QColor("#fff36a"), 2))
+        painter.drawEllipse(calcium_center_point, 5, 5)
+        painter.drawText(
+            calcium_center_point + QPointF(7, -7),
+            f"Ca {selected_spine.get('spine_roi', '')}",
+        )
+        focus_points = list(calcium_points or parent_points)
+        measured_distance: float | None = None
+        if target_center is not None:
+            target_point = QPointF(float(target_center[0]), float(target_center[1]))
+            pen = QPen(QColor("#ffffff"), 2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(calcium_center_point, target_point)
+            painter.setPen(QPen(QColor("#ff37d8"), 3))
+            painter.drawEllipse(target_point, 6, 6)
+            painter.drawText(
+                target_point + QPointF(8, 12), f"Synpo spine {synpo_spine_id}"
+            )
+            focus_points.append((float(target_center[0]), float(target_center[1])))
+            measured_distance = float(
+                np.linalg.norm(np.asarray(transformed_center) - target_center)
+            )
+        painter.end()
+        self._image = image
+        self.reset_view()
+        self.focus_on_image_points(focus_points)
+        return {
+            "transformed_center_xy": transformed_center.tolist(),
+            "target_center_xy": (
+                target_center.tolist() if target_center is not None else None
+            ),
+            "measured_distance_px": measured_distance,
+            "transformed_roi_in_frame": any(
+                0.0 <= point[0] < image.width()
+                and 0.0 <= point[1] < image.height()
+                for point in calcium_points
+            ),
+        }
+
+    def set_synpo_browse_scene(
+        self,
+        scene: dict[str, object],
+        selected_spine_id: int | None = None,
+    ) -> None:
+        self._persistent_synpo_calcium_overlay = None
+        image = self._synpo_background(scene)
+        spines = np.asarray(scene["spine_projection"], dtype=np.uint32)
+        self._clickable_spine_projection = spines
+        target = next(
+            (
+                row
+                for row in scene.get("spines", [])
+                if int(row.get("spine_id") or 0) == int(selected_spine_id or 0)
+            ),
+            None,
+        )
+        if target is not None and selected_spine_id is not None:
+            image_buffer = image.bits()
+            rgb = np.frombuffer(image_buffer, dtype=np.uint8).reshape(
+                image.height(), image.bytesPerLine()
+            )[:, : image.width() * 3].reshape(image.height(), image.width(), 3)
+            width = max(
+                6,
+                min(28, round(max(image.width(), image.height()) / 350)),
+            )
+            self._highlight_label_boundary(
+                rgb, spines, int(selected_spine_id), (255, 40, 220), width
+            )
+            center = target.get("center_xy")
+            if isinstance(center, (list, tuple)) and len(center) == 2:
+                painter = QPainter(image)
+                point = QPointF(float(center[0]), float(center[1]))
+                painter.setPen(QPen(QColor("#ff37d8"), 3))
+                painter.drawEllipse(point, 6, 6)
+                painter.drawText(
+                    point + QPointF(8, 12), f"Synpo spine {selected_spine_id}"
+                )
+                painter.end()
+        self._image = image
+        self.reset_view()
+        center = target.get("center_xy") if target is not None else None
+        if isinstance(center, (list, tuple)) and len(center) == 2:
+            self.focus_on_image_points([(float(center[0]), float(center[1]))])
+
+    def _render(self) -> None:
+        super()._render()
+        overlay = getattr(self, "_persistent_synpo_calcium_overlay", None)
+        pixmap = self.pixmap()
+        if self._image is None or pixmap is None or not overlay:
+            return
+        target = self._target_rect()
+        scale_x = target.width() / max(1, self._image.width())
+        scale_y = target.height() / max(1, self._image.height())
+
+        def display_polygon(points_value: object) -> QPolygon:
+            return QPolygon(
+                [
+                    QPoint(
+                        round(target.left() + float(point[0]) * scale_x),
+                        round(target.top() + float(point[1]) * scale_y),
+                    )
+                    for point in self._points(points_value)
+                ]
+            )
+
+        canvas = pixmap.copy()
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for points_value, color, width, fill in (
+            (
+                overlay.get("parent_points_xy", []),
+                QColor(20, 245, 255, 255),
+                4,
+                QColor(20, 245, 255, 35),
+            ),
+            (
+                overlay.get("spine_points_xy", []),
+                QColor(255, 245, 0, 255),
+                6,
+                QColor(255, 245, 0, 70),
+            ),
+        ):
+            polygon = display_polygon(points_value)
+            if len(polygon) < 2:
+                continue
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(0, 0, 0, 235), width + 4))
+            painter.drawPolygon(polygon)
+            painter.setBrush(fill)
+            painter.setPen(QPen(color, width))
+            painter.drawPolygon(polygon)
+        painter.end()
+        self.setPixmap(canvas)
+
+    def _spine_at_display_position(self, position: QPointF) -> int:
+        labels = self._clickable_spine_projection
+        if self._image is None or labels is None:
+            return 0
+        target = self._target_rect()
+        if not target.contains(position) or target.width() <= 0 or target.height() <= 0:
+            return 0
+        image_x = (position.x() - target.left()) * labels.shape[1] / target.width()
+        image_y = (position.y() - target.top()) * labels.shape[0] / target.height()
+        x = min(labels.shape[1] - 1, max(0, round(image_x)))
+        y = min(labels.shape[0] - 1, max(0, round(image_y)))
+        direct = int(labels[y, x])
+        if direct > 0:
+            return direct
+        scale_x = target.width() / max(1, labels.shape[1])
+        scale_y = target.height() / max(1, labels.shape[0])
+        radius = max(1, min(40, round(8.0 / max(1e-9, min(scale_x, scale_y)))))
+        x0, x1 = max(0, x - radius), min(labels.shape[1], x + radius + 1)
+        y0, y1 = max(0, y - radius), min(labels.shape[0], y + radius + 1)
+        local = labels[y0:y1, x0:x1]
+        positions = np.argwhere(local > 0)
+        if not len(positions):
+            return 0
+        distances = (positions[:, 1] + x0 - image_x) ** 2 + (
+            positions[:, 0] + y0 - image_y
+        ) ** 2
+        nearest = positions[int(np.argmin(distances))]
+        return int(local[int(nearest[0]), int(nearest[1])])
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if (
+            not self._pan_mode
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._clickable_spine_projection is not None
+        ):
+            self.spine_clicked.emit(self._spine_at_display_position(event.position()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class MultiRoiView(SliceView):
@@ -707,7 +1599,7 @@ class AnalysisRoiDialog(QDialog):
 
 
 class ZoomControls(QWidget):
-    def __init__(self, view: SliceView) -> None:
+    def __init__(self, view: SliceView, *, show_pan_button: bool = False) -> None:
         super().__init__()
         self.view = view
         layout = QHBoxLayout(self)
@@ -724,13 +1616,99 @@ class ZoomControls(QWidget):
         native_button.setToolTip("Show one source image pixel per display pixel.")
         native_button.clicked.connect(view.set_native_zoom)
         layout.addWidget(native_button)
+        self.pan_button: QPushButton | None = None
+        if show_pan_button:
+            self.pan_button = QPushButton("Pan")
+            self.pan_button.setCheckable(True)
+            self.pan_button.setToolTip(
+                "Turn on, then drag with the left mouse button to move this image."
+            )
+            self.pan_button.toggled.connect(view.set_pan_mode)
+            layout.addWidget(self.pan_button)
         view.zoom_changed.connect(self._set_zoom)
-        self.setToolTip("Mouse wheel: zoom around pointer. Middle-button drag: pan.")
+        self.setToolTip(
+            "Mouse wheel: zoom this image around the pointer. "
+            "Middle-button drag always pans."
+        )
         QTimer.singleShot(0, lambda: self._set_zoom(view.zoom_percent()))
 
     @Slot(int)
     def _set_zoom(self, percent: int) -> None:
         self.zoom_label.setText(f"Zoom: {percent}%")
+
+
+class CalciumToneControls(QWidget):
+    """Compact, debounced brightness/contrast controls for calcium images."""
+
+    tone_changed = Signal(int, int, bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+
+        layout.addWidget(QLabel("Brightness:"))
+        self.brightness = QSlider(Qt.Orientation.Horizontal)
+        self.brightness.setRange(-100, 100)
+        self.brightness.setValue(0)
+        self.brightness.setSingleStep(5)
+        self.brightness.setMinimumWidth(90)
+        layout.addWidget(self.brightness, 1)
+        self.brightness_value = QLabel("0")
+        self.brightness_value.setMinimumWidth(32)
+        layout.addWidget(self.brightness_value)
+
+        layout.addWidget(QLabel("Contrast:"))
+        self.contrast = QSlider(Qt.Orientation.Horizontal)
+        self.contrast.setRange(10, 400)
+        self.contrast.setValue(100)
+        self.contrast.setSingleStep(10)
+        self.contrast.setMinimumWidth(90)
+        layout.addWidget(self.contrast, 1)
+        self.contrast_value = QLabel("100%")
+        self.contrast_value.setMinimumWidth(46)
+        layout.addWidget(self.contrast_value)
+
+        self.auto_levels = QCheckBox("Auto levels")
+        self.auto_levels.setToolTip(
+            "Stretch the displayed calcium intensities between robust dark and "
+            "bright percentiles. Source pixels are not changed."
+        )
+        layout.addWidget(self.auto_levels)
+        reset = QPushButton("Reset")
+        reset.clicked.connect(self.reset)
+        layout.addWidget(reset)
+
+        self._change_timer = QTimer(self)
+        self._change_timer.setSingleShot(True)
+        self._change_timer.setInterval(60)
+        self._change_timer.timeout.connect(self._emit_tone)
+        self.brightness.valueChanged.connect(self._schedule_change)
+        self.contrast.valueChanged.connect(self._schedule_change)
+        self.auto_levels.toggled.connect(self._schedule_change)
+        self.setToolTip(
+            "Display-only calcium-image adjustment. It does not alter images, "
+            "ROIs, registrations, matches, or measurements."
+        )
+
+    def _schedule_change(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.brightness_value.setText(str(self.brightness.value()))
+        self.contrast_value.setText(f"{self.contrast.value()}%")
+        self._change_timer.start()
+
+    def _emit_tone(self) -> None:
+        self.tone_changed.emit(
+            self.brightness.value(),
+            self.contrast.value(),
+            self.auto_levels.isChecked(),
+        )
+
+    def reset(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.brightness.setValue(0)
+        self.contrast.setValue(100)
+        self.auto_levels.setChecked(False)
+        self._schedule_change()
 
 
 class EndpointHintView(SliceView):
@@ -1247,12 +2225,30 @@ class MorphologyPlotCanvas(FigureCanvasQTAgg):
         from matplotlib.colors import to_rgba
 
         self.figure.clear()
+        style = {**DEFAULT_PLOT_STYLE, **dict(result.get("plot_style", {}))}
+        visible_groups = {
+            str(group) for group in style.get("visible_groups", []) if str(group)
+        }
+        display_result = result
+        if visible_groups and mode in {
+            "pca_interpretation",
+            "pca_3d_features",
+            "protein_volume",
+        }:
+            display_result = {
+                **result,
+                "assignments": [
+                    row
+                    for row in result.get("assignments", [])
+                    if str(row.get("experimental_group", "")) in visible_groups
+                ],
+            }
         if mode == "pca_interpretation":
-            draw_pca_interpretation(self.figure, result)
+            draw_pca_interpretation(self.figure, display_result)
             self.draw_idle()
             return
         if mode == "pca_3d_features":
-            draw_pca_3d_feature_axes(self.figure, result)
+            draw_pca_3d_feature_axes(self.figure, display_result)
             self.draw_idle()
             return
         assignments = list(result.get("assignments", []))
@@ -1272,7 +2268,6 @@ class MorphologyPlotCanvas(FigureCanvasQTAgg):
             mode == "embedding" and embedding_dimensions == 3
         )
         axis = self.figure.add_subplot(111, projection="3d" if is_3d else None)
-        style = {**DEFAULT_PLOT_STYLE, **dict(result.get("plot_style", {}))}
         axes_rgba = to_rgba(
             str(style["axes_color"]), alpha=float(style["axes_alpha"])
         )
@@ -1282,10 +2277,25 @@ class MorphologyPlotCanvas(FigureCanvasQTAgg):
         self.figure.patch.set_facecolor(background_rgba)
         axis.set_facecolor(background_rgba)
         group_markers = ("o", "^", "s", "D", "P", "X", "v", "<", ">", "*")
-        groups = sorted({str(row.get("experimental_group", "")) for row in assignments})
+        all_groups = sorted(
+            {str(row.get("experimental_group", "")) for row in assignments}
+        )
+        groups = (
+            [group for group in all_groups if group in visible_groups]
+            if visible_groups
+            and mode
+            in {
+                "volume_length",
+                "volume_straight",
+                "custom_features",
+                "pca",
+                "embedding",
+            }
+            else all_groups
+        )
         marker_by_group = {
             group: group_markers[index % len(group_markers)]
-            for index, group in enumerate(groups)
+            for index, group in enumerate(all_groups)
         }
         if mode in {"volume_length", "volume_straight", "pca", "embedding"}:
             for cluster in sorted(colors):
@@ -1391,7 +2401,7 @@ class MorphologyPlotCanvas(FigureCanvasQTAgg):
             axis.bar([str(value) for value in clusters], values, color=[colors[value] for value in clusters])
             axis.set(xlabel="Morphology cluster", ylabel="Protein-positive spines (%)", title="Protein-positive fraction")
         elif mode == "protein_volume":
-            draw_protein_puncta_volume(axis, result)
+            draw_protein_puncta_volume(axis, display_result)
         elif mode == "protein_position":
             summary = list(result.get("protein_summary", []))
             for cluster in sorted(colors):
@@ -1463,6 +2473,23 @@ class MorphologyPlotCanvas(FigureCanvasQTAgg):
                 text_item.set_color(axes_rgba)
         axis.grid(alpha=0.2, color=axes_rgba)
         self.draw_idle()
+
+
+def _scrollable_clustering_page(content: QWidget) -> QScrollArea:
+    """Keep a clustering page usable when the window is smaller than its contents."""
+
+    minimum = content.minimumSizeHint()
+    if minimum.isValid():
+        content.setMinimumSize(
+            max(content.minimumWidth(), minimum.width()),
+            max(content.minimumHeight(), minimum.height()),
+        )
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setWidget(content)
+    return scroll
 
 
 class ClusterCountScorePanel(QWidget):
@@ -1710,8 +2737,12 @@ class CorrelationMatrixPanel(QWidget):
 
     settings_changed = Signal(object)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        features: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
         super().__init__()
+        available_features = features or STANDARD_MORPHOLOGY_FEATURES
         self._result: dict[str, object] | None = None
         self._result_identity: int | None = None
         self._data: dict[str, object] | None = None
@@ -1726,7 +2757,7 @@ class CorrelationMatrixPanel(QWidget):
         feature_layout = QGridLayout(feature_group)
         self.feature_checks: dict[str, QCheckBox] = {}
         for index, (feature, (label, _column)) in enumerate(
-            MORPHOLOGY_FEATURES.items()
+            available_features.items()
         ):
             checkbox = QCheckBox(label)
             checkbox.setChecked(feature in DEFAULT_FEATURES)
@@ -2940,6 +3971,469 @@ class ContextViewerDialog(QDialog):
                 QMessageBox.warning(self, "Cannot save snapshot", str(destination))
 
 
+class ClusterStatisticsPanel(QWidget):
+    """Interactive post-clustering group comparisons and composition plots."""
+
+    statistics_changed = Signal(object)
+
+    _TABLES = (
+        ("Cluster composition", "composition_summary"),
+        ("Omnibus chi-square", "composition_omnibus"),
+        ("Agresti-Caffo pairwise", "agresti_caffo"),
+        ("Unit-level permutations", "unit_permutation"),
+        ("Metric descriptives", "metric_descriptives"),
+        ("Metric comparisons", "metric_comparisons"),
+        ("Protein-presence comparisons", "protein_presence_comparisons"),
+        ("Protein-presence unit permutations", "protein_presence_unit_permutation"),
+    )
+
+    def __init__(
+        self, features: dict[str, tuple[str, str]] | None = None
+    ) -> None:
+        super().__init__()
+        self._features = features or MORPHOLOGY_FEATURES
+        self._result: dict[str, object] | None = None
+        self._statistics: dict[str, object] | None = None
+        self._result_identity: int | None = None
+
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Choose the inferential unit independently of clustering. Spine-level "
+            "tests assume independent spines; specimen and neuron modes aggregate "
+            "first and give every unit equal weight. Clustering-input metrics remain "
+            "descriptive to avoid circular inference."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        options = QGridLayout()
+        options.addWidget(QLabel("Analysis level:"), 0, 0)
+        self.analysis_level = QComboBox()
+        self.analysis_level.addItem("Specimen (equal specimen weights)", "specimen")
+        self.analysis_level.addItem("Neuron / subject (permutation)", "neuron")
+        self.analysis_level.addItem("Spine (independence assumed)", "spine")
+        options.addWidget(self.analysis_level, 0, 1)
+        options.addWidget(QLabel("Continuous test:"), 0, 2)
+        self.continuous_test = QComboBox()
+        self.continuous_test.addItem("Welch t-test", "welch")
+        self.continuous_test.addItem("Mann-Whitney U", "mann_whitney")
+        self.continuous_test.addItem("Permutation of mean difference", "permutation")
+        options.addWidget(self.continuous_test, 0, 3)
+
+        options.addWidget(QLabel("Confidence:"), 1, 0)
+        self.confidence = QDoubleSpinBox()
+        self.confidence.setRange(90.0, 99.0)
+        self.confidence.setDecimals(1)
+        self.confidence.setValue(95.0)
+        self.confidence.setSuffix(" %")
+        options.addWidget(self.confidence, 1, 1)
+        options.addWidget(QLabel("Permutations:"), 1, 2)
+        self.permutations = QSpinBox()
+        self.permutations.setRange(100, 100_000)
+        self.permutations.setSingleStep(1_000)
+        self.permutations.setValue(10_000)
+        options.addWidget(self.permutations, 1, 3)
+        options.addWidget(QLabel("Random seed:"), 2, 0)
+        self.seed = QSpinBox()
+        self.seed.setRange(0, 2_000_000_000)
+        self.seed.setValue(42)
+        options.addWidget(self.seed, 2, 1)
+        layout.addLayout(options)
+
+        selectors = QHBoxLayout()
+        group_box = QGroupBox("Groups included in statistics")
+        group_layout = QVBoxLayout(group_box)
+        self.groups = QListWidget()
+        self.groups.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.groups.setMaximumHeight(120)
+        group_layout.addWidget(self.groups)
+        selectors.addWidget(group_box, 1)
+        metric_box = QGroupBox("Continuous metrics to compare inside clusters")
+        metric_layout = QVBoxLayout(metric_box)
+        self.metrics = QListWidget()
+        self.metrics.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.metrics.setMaximumHeight(120)
+        for key, (label, _column) in self._features.items():
+            self.metrics.addItem(label)
+            item = self.metrics.item(self.metrics.count() - 1)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setSelected(
+                key in {
+                    "linear_volume",
+                    "curvilinear_length",
+                    "protein_puncta_count",
+                    "protein_puncta_total_volume",
+                    "calcium_peak_dff",
+                    "calcium_pearson_r",
+                }
+            )
+        metric_layout.addWidget(self.metrics)
+        selectors.addWidget(metric_box, 2)
+        layout.addLayout(selectors)
+
+        action_row = QHBoxLayout()
+        calculate_button = QPushButton("Calculate / update statistics")
+        calculate_button.clicked.connect(self._calculate)
+        action_row.addWidget(calculate_button)
+        action_row.addStretch(1)
+        action_row.addWidget(QLabel("Statistical graph:"))
+        self.plot_mode = QComboBox()
+        self.plot_mode.addItem("100% stacked bars", "stacked")
+        self.plot_mode.addItem("Grouped percentages", "grouped")
+        self.plot_mode.addItem("One pie per group", "faceted_pies")
+        self.plot_mode.addItem("Pooled pie", "pooled_pie")
+        self.plot_mode.addItem("Chi-square residuals", "chi_square_residuals")
+        self.plot_mode.addItem(
+            "Cluster-composition Agresti-Caffo forest", "forest"
+        )
+        self.plot_mode.addItem(
+            "Unit-level cluster fractions", "unit_cluster_fractions"
+        )
+        self.plot_mode.addItem(
+            "Continuous metric distributions", "metric_distribution"
+        )
+        self.plot_mode.addItem(
+            "Pooled protein-puncta presence", "protein_presence"
+        )
+        self.plot_mode.addItem(
+            "Protein-presence Agresti-Caffo forest",
+            "protein_presence_forest",
+        )
+        self.plot_mode.addItem(
+            "Unit-level protein-positive fractions", "protein_presence_unit"
+        )
+        self.plot_mode.currentIndexChanged.connect(self._plot_mode_changed)
+        action_row.addWidget(self.plot_mode)
+        action_row.addWidget(QLabel("Pie labels:"))
+        self.pie_labels = QComboBox()
+        self.pie_labels.addItem("Percent", "percent")
+        self.pie_labels.addItem("Count", "count")
+        self.pie_labels.addItem("Percent and count", "both")
+        self.pie_labels.addItem("None", "none")
+        action_row.addWidget(self.pie_labels)
+        export_button = QPushButton("Export current plot…")
+        export_button.clicked.connect(self._export_plot)
+        action_row.addWidget(export_button)
+        layout.addLayout(action_row)
+
+        detail_row = QHBoxLayout()
+        self.plot_metric_label = QLabel("Metric:")
+        detail_row.addWidget(self.plot_metric_label)
+        self.plot_metric = QComboBox()
+        self.plot_metric.setMinimumContentsLength(24)
+        self.plot_metric.currentIndexChanged.connect(self._render_plot)
+        detail_row.addWidget(self.plot_metric, 1)
+        self.plot_cluster_label = QLabel("Cluster:")
+        detail_row.addWidget(self.plot_cluster_label)
+        self.plot_cluster = QComboBox()
+        self.plot_cluster.currentIndexChanged.connect(self._render_plot)
+        detail_row.addWidget(self.plot_cluster)
+        detail_row.addStretch(1)
+        layout.addLayout(detail_row)
+        self._plot_mode_changed(render=False)
+
+        self.summary = QLabel("Run or load a clustering analysis, then calculate statistics.")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.figure = Figure(figsize=(9.5, 5.5), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setMinimumSize(560, 360)
+        layout.addWidget(self.canvas, 1)
+
+        table_row = QHBoxLayout()
+        table_row.addWidget(QLabel("Results table:"))
+        self.table_kind = QComboBox()
+        for label, key in self._TABLES:
+            self.table_kind.addItem(label, key)
+        self.table_kind.currentIndexChanged.connect(self._populate_table)
+        table_row.addWidget(self.table_kind)
+        table_row.addStretch(1)
+        layout.addLayout(table_row)
+        self.table = QTableWidget(0, 0)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.setMinimumHeight(220)
+        layout.addWidget(self.table)
+
+    def show_run(self, result: dict[str, object]) -> None:
+        is_new = id(result) != self._result_identity
+        self._result = result
+        self._result_identity = id(result)
+        if is_new:
+            assignments = list(result.get("assignments", []))
+            available_groups = sorted(
+                {str(row.get("experimental_group", "")) for row in assignments}
+            )
+            self.groups.blockSignals(True)
+            self.groups.clear()
+            for group in available_groups:
+                self.groups.addItem(group or "(blank group)")
+                item = self.groups.item(self.groups.count() - 1)
+                item.setData(Qt.ItemDataRole.UserRole, group)
+                item.setSelected(True)
+            self.groups.blockSignals(False)
+            stored = (
+                dict(result.get("statistics", {}))
+                if isinstance(result.get("statistics"), dict)
+                else {}
+            )
+            self._statistics = stored or None
+            if stored:
+                settings = ClusteringStatisticsSettings.from_dict(
+                    dict(stored.get("settings", {}))
+                )
+                self._load_settings(settings)
+        self._refresh_plot_selectors()
+        self._render_plot()
+        self._populate_table()
+
+    def _load_settings(self, settings: ClusteringStatisticsSettings) -> None:
+        self.analysis_level.setCurrentIndex(
+            max(0, self.analysis_level.findData(settings.analysis_level))
+        )
+        self.continuous_test.setCurrentIndex(
+            max(0, self.continuous_test.findData(settings.continuous_test))
+        )
+        self.confidence.setValue(settings.confidence_level * 100.0)
+        self.permutations.setValue(settings.permutation_repetitions)
+        self.seed.setValue(settings.random_seed)
+        self.pie_labels.setCurrentIndex(
+            max(0, self.pie_labels.findData(settings.pie_labels))
+        )
+        groups = set(settings.included_groups)
+        for index in range(self.groups.count()):
+            item = self.groups.item(index)
+            item.setSelected(
+                not groups
+                or str(item.data(Qt.ItemDataRole.UserRole)) in groups
+            )
+        metrics = set(settings.metrics)
+        if metrics:
+            for index in range(self.metrics.count()):
+                item = self.metrics.item(index)
+                item.setSelected(
+                    str(item.data(Qt.ItemDataRole.UserRole)) in metrics
+                )
+
+    def settings(self) -> ClusteringStatisticsSettings:
+        groups = tuple(
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for item in self.groups.selectedItems()
+        )
+        metrics = tuple(
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for item in self.metrics.selectedItems()
+        )
+        if self.groups.count() and not groups:
+            raise ValueError("Select at least one experimental group for statistics.")
+        return ClusteringStatisticsSettings(
+            analysis_level=str(self.analysis_level.currentData()),
+            included_groups=groups,
+            confidence_level=self.confidence.value() / 100.0,
+            permutation_repetitions=self.permutations.value(),
+            random_seed=self.seed.value(),
+            continuous_test=str(self.continuous_test.currentData()),
+            metrics=metrics,
+            pie_labels=str(self.pie_labels.currentData()),
+        )
+
+    def _calculate(self) -> None:
+        if self._result is None:
+            return
+        try:
+            settings = self.settings()
+            statistics_result = calculate_clustering_statistics(
+                self._result,
+                settings,
+                metric_labels={key: value[0] for key, value in self._features.items()},
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot calculate statistics", str(exc))
+            return
+        self._statistics = statistics_result
+        self._result["statistics"] = statistics_result
+        self.statistics_changed.emit(statistics_result)
+        self._refresh_plot_selectors()
+        self._render_plot()
+        self._populate_table()
+
+    def _refresh_plot_selectors(self) -> None:
+        previous_metric = self.plot_metric.currentData()
+        previous_cluster = self.plot_cluster.currentData()
+        self.plot_metric.blockSignals(True)
+        self.plot_cluster.blockSignals(True)
+        self.plot_metric.clear()
+        self.plot_cluster.clear()
+        if self._statistics:
+            metric_rows = list(self._statistics.get("metric_descriptives", []))
+            seen_metrics: set[str] = set()
+            for row in metric_rows:
+                metric = str(row.get("metric", ""))
+                if not metric or metric in seen_metrics:
+                    continue
+                seen_metrics.add(metric)
+                label = str(
+                    row.get("metric_label")
+                    or self._features.get(metric, (metric, ""))[0]
+                )
+                self.plot_metric.addItem(label, metric)
+            for cluster in self._statistics.get("clusters", []):
+                self.plot_cluster.addItem(str(int(cluster)), int(cluster))
+        metric_index = self.plot_metric.findData(previous_metric)
+        cluster_index = self.plot_cluster.findData(previous_cluster)
+        self.plot_metric.setCurrentIndex(max(0, metric_index))
+        self.plot_cluster.setCurrentIndex(max(0, cluster_index))
+        self.plot_metric.blockSignals(False)
+        self.plot_cluster.blockSignals(False)
+        self._plot_mode_changed(render=False)
+
+    def _plot_mode_changed(
+        self, *_args, render: bool = True
+    ) -> None:  # type: ignore[no-untyped-def]
+        mode = str(self.plot_mode.currentData())
+        metric_enabled = mode == "metric_distribution"
+        cluster_enabled = mode in {
+            "unit_cluster_fractions",
+            "metric_distribution",
+            "protein_presence",
+            "protein_presence_unit",
+        }
+        pie_enabled = mode in {"faceted_pies", "pooled_pie"}
+        self.plot_metric_label.setEnabled(metric_enabled)
+        self.plot_metric.setEnabled(metric_enabled)
+        self.plot_cluster_label.setEnabled(cluster_enabled)
+        self.plot_cluster.setEnabled(cluster_enabled)
+        self.pie_labels.setEnabled(pie_enabled)
+        if render:
+            self._render_plot()
+
+    def _render_plot(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self.figure.clear()
+        if self._result is None or self._statistics is None:
+            axis = self.figure.add_subplot(111)
+            axis.text(
+                0.5,
+                0.5,
+                "Calculate statistics to create comparison graphs.",
+                ha="center",
+                va="center",
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            self.canvas.draw_idle()
+            return
+        draw_cluster_statistics(
+            self.figure,
+            self._result,
+            self._statistics,
+            str(self.plot_mode.currentData()),
+            selected_metric=(
+                str(self.plot_metric.currentData())
+                if self.plot_metric.currentData() is not None
+                else None
+            ),
+            selected_cluster=(
+                int(self.plot_cluster.currentData())
+                if self.plot_cluster.currentData() is not None
+                else None
+            ),
+        )
+        from matplotlib.colors import to_rgba
+
+        style = {
+            **DEFAULT_PLOT_STYLE,
+            **dict(self._result.get("plot_style", {})),
+        }
+        axes_color = to_rgba(
+            str(style["axes_color"]), alpha=float(style["axes_alpha"])
+        )
+        background = to_rgba(
+            str(style["background_color"]),
+            alpha=float(style["background_alpha"]),
+        )
+        self.figure.patch.set_facecolor(background)
+        for axis in self.figure.axes:
+            axis.set_facecolor(background)
+            axis.tick_params(colors=axes_color)
+            axis.xaxis.label.set_color(axes_color)
+            axis.yaxis.label.set_color(axes_color)
+            axis.title.set_color(axes_color)
+            for spine in axis.spines.values():
+                spine.set_color(axes_color)
+        warnings = list(self._statistics.get("warnings", []))
+        omnibus = list(self._statistics.get("composition_omnibus", []))
+        omnibus_text = ""
+        if omnibus:
+            omnibus_text = (
+                f" Pearson chi-square p={float(omnibus[0]['p_value']):.4g}; "
+                f"Cramer's V={float(omnibus[0]['cramers_v']):.3f}."
+            )
+        self.summary.setText(
+            f"Statistics use {self._statistics.get('settings', {}).get('analysis_level')} "
+            f"as the selected unit.{omnibus_text} "
+            + (" Warnings: " + " ".join(warnings) if warnings else "")
+        )
+        self.canvas.draw_idle()
+
+    def _populate_table(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        rows = (
+            list(self._statistics.get(str(self.table_kind.currentData()), []))
+            if self._statistics
+            else []
+        )
+        columns: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in columns:
+                    columns.append(str(key))
+        self.table.setColumnCount(len(columns))
+        self.table.setHorizontalHeaderLabels(columns)
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column_index, column in enumerate(columns):
+                value = row.get(column)
+                if isinstance(value, float):
+                    text_value = f"{value:.6g}"
+                else:
+                    text_value = "" if value is None else str(value)
+                self.table.setItem(
+                    row_index, column_index, QTableWidgetItem(text_value)
+                )
+
+    def _export_plot(self) -> None:
+        if self._statistics is None:
+            QMessageBox.information(
+                self, "No statistics", "Calculate statistics before exporting a plot."
+            )
+            return
+        detail = str(self.plot_mode.currentData() or "comparison")
+        if self.plot_metric.isEnabled() and self.plot_metric.currentData():
+            detail += f"_{self.plot_metric.currentData()}"
+        if self.plot_cluster.isEnabled() and self.plot_cluster.currentData() is not None:
+            detail += f"_cluster_{self.plot_cluster.currentData()}"
+        selected, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export statistical plot",
+            f"cluster_statistics_{detail}.svg",
+            "SVG vector (*.svg);;PDF vector (*.pdf);;PNG image (*.png)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        if not path.suffix:
+            path = path.with_suffix(
+                ".pdf" if selected_filter.startswith("PDF") else ".png" if selected_filter.startswith("PNG") else ".svg"
+            )
+        self.figure.savefig(
+            path,
+            dpi=600 if path.suffix.lower() == ".png" else None,
+            bbox_inches="tight",
+        )
+
+
 class AreaSelectionDialog(QDialog):
     area_selected = Signal(object)
 
@@ -3058,12 +4552,14 @@ class BatchPreprocessWorker(QObject):
         manifest: dict[str, object],
         project_path: Path,
         specimen_indices: list[int] | None = None,
+        channels: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.manifest = manifest
         self.project_path = project_path
         self.cancel_event = Event()
         self.specimen_indices = specimen_indices
+        self.channels = channels
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -3079,6 +4575,7 @@ class BatchPreprocessWorker(QObject):
                 ),
                 cancel_event=self.cancel_event,
                 specimen_indices=self.specimen_indices,
+                channels=self.channels,
             )
         except ProcessingCancelled as exc:
             self.cancelled.emit(str(exc))
@@ -3102,6 +4599,7 @@ class DetectionWorker(QObject):
         project_path: Path,
         specimen_indices: list[int] | None = None,
         force: bool = False,
+        clusters_only: bool = False,
     ) -> None:
         super().__init__()
         self.manifest = manifest
@@ -3109,6 +4607,7 @@ class DetectionWorker(QObject):
         self.cancel_event = Event()
         self.specimen_indices = specimen_indices
         self.force = force
+        self.clusters_only = clusters_only
 
     def cancel(self) -> None:
         self.cancel_event.set()
@@ -3116,18 +4615,23 @@ class DetectionWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            result = detect_project(
-                self.manifest,
-                self.project_path,
-                progress=lambda phase, current, total, detail: self.progress.emit(
+            operation = redetect_project_clusters if self.clusters_only else detect_project
+            keyword_arguments = {
+                "progress": lambda phase, current, total, detail: self.progress.emit(
                     phase, current, total, detail
                 ),
-                pair_completed=lambda index, summary: self.pair_completed.emit(
+                "pair_completed": lambda index, summary: self.pair_completed.emit(
                     index, summary
                 ),
-                cancel_event=self.cancel_event,
-                specimen_indices=self.specimen_indices,
-                force=self.force,
+                "cancel_event": self.cancel_event,
+                "specimen_indices": self.specimen_indices,
+            }
+            if not self.clusters_only:
+                keyword_arguments["force"] = self.force
+            result = operation(
+                self.manifest,
+                self.project_path,
+                **keyword_arguments,
             )
         except ProcessingCancelled as exc:
             self.cancelled.emit(str(exc))
@@ -3191,6 +4695,202 @@ class MorphologyClusteringWorker(QObject):
             self.progress.emit("Morphology clustering", 0, 1, "Preparing all-spine feature matrix")
             result = save_named_morphology_run(self.manifest, self.project_path, self.name, self.settings)
             self.progress.emit("Morphology clustering", 1, 1, "Saved named analysis run")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(result)
+
+
+class CalciumImportWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        source_roots: Path | list[Path] | tuple[Path, ...],
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        if isinstance(source_roots, Path):
+            self.source_roots = (source_roots,)
+        else:
+            self.source_roots = tuple(source_roots)
+
+    @Slot()
+    def run(self) -> None:
+        datasets: list[dict[str, object]] = []
+        errors: list[str] = []
+        total = len(self.source_roots)
+        try:
+            for index, source_root in enumerate(self.source_roots):
+                self.progress.emit(
+                    "Importing calcium results",
+                    index,
+                    total,
+                    f"Reading {source_root.name}: tables, ROIs, and references",
+                )
+                try:
+                    datasets.append(
+                        import_calcium_results(
+                            self.manifest,
+                            self.project_path,
+                            source_root,
+                            embed_reference_images=True,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(f"{source_root}: {exc}")
+                self.progress.emit(
+                    "Importing calcium results",
+                    index + 1,
+                    total,
+                    f"Finished {source_root.name}",
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        if not datasets:
+            self.failed.emit(
+                "No calcium folders could be imported.\n\n" + "\n".join(errors)
+            )
+            return
+        self.completed.emit({"datasets": datasets, "errors": errors})
+
+
+class CalciumSceneWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, manifest: dict[str, object], specimen_index: int) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.specimen_index = specimen_index
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Preparing calcium registration", 0, 1, "Projecting the selected Synpo field"
+            )
+            scene = synpo_matching_scene(self.manifest, self.specimen_index)
+            self.progress.emit(
+                "Preparing calcium registration", 1, 1, "Registration scene ready"
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(
+            {"specimen_index": self.specimen_index, "scene": scene}
+        )
+
+
+class CalciumAutoMatchWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        project_path: Path,
+        dataset: dict[str, object],
+        maximum_distance_px: float,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.project_path = project_path
+        self.dataset = dataset
+        self.maximum_distance_px = maximum_distance_px
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Matching calcium spines", 0, 1, "Projecting fields and solving one-to-one assignments"
+            )
+            counts = automatic_match_spines(
+                self.manifest,
+                self.dataset,
+                maximum_distance_px=self.maximum_distance_px,
+            )
+            save_calcium_dataset(self.manifest, self.project_path, self.dataset)
+            self.progress.emit(
+                "Matching calcium spines", 1, 1, "Match proposals saved"
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit({"dataset": self.dataset, "counts": counts})
+
+
+class CalciumExportWorker(QObject):
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        dataset_id: str,
+        morphology_run_id: str,
+        output_path: Path,
+        accepted_states: tuple[str, ...],
+        x_key: str,
+        y_key: str,
+        included_groups: tuple[str, ...],
+        point_alpha: float,
+        log_x: bool,
+        log_y: bool,
+        show_regression: bool,
+        analysis_name: str,
+        analysis_run_id: str,
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.dataset_id = dataset_id
+        self.morphology_run_id = morphology_run_id
+        self.output_path = output_path
+        self.accepted_states = accepted_states
+        self.x_key = x_key
+        self.y_key = y_key
+        self.included_groups = included_groups
+        self.point_alpha = point_alpha
+        self.log_x = log_x
+        self.log_y = log_y
+        self.show_regression = show_regression
+        self.analysis_name = analysis_name
+        self.analysis_run_id = analysis_run_id
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "Exporting calcium analysis", 0, 1, "Writing workbook, CSVs, and figures"
+            )
+            result = export_calcium_analysis(
+                self.manifest,
+                self.dataset_id,
+                self.morphology_run_id,
+                self.output_path,
+                accepted_states=self.accepted_states,
+                x_key=self.x_key,
+                y_key=self.y_key,
+                included_groups=self.included_groups,
+                point_alpha=self.point_alpha,
+                log_x=self.log_x,
+                log_y=self.log_y,
+                show_regression=self.show_regression,
+                analysis_name=self.analysis_name,
+                analysis_run_id=self.analysis_run_id,
+            )
+            self.progress.emit(
+                "Exporting calcium analysis", 1, 1, "Analysis package saved"
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -3366,6 +5066,39 @@ class DistributionPreviewWorker(QObject):
             self.failed.emit(str(exc))
             return
         self.completed.emit(preview)
+
+
+class MorphologyPreviewWorker(QObject):
+    """Load one geometry-review crop without blocking the Qt event loop."""
+
+    progress = Signal(str, int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self, manifest: dict[str, object], specimen_index: int, spine_id: int
+    ) -> None:
+        super().__init__()
+        self.manifest = manifest
+        self.specimen_index = specimen_index
+        self.spine_id = spine_id
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            preview = load_morphology_preview(
+                self.manifest, self.specimen_index, self.spine_id
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.completed.emit(
+            {
+                "specimen_index": self.specimen_index,
+                "spine_id": self.spine_id,
+                "preview": preview,
+            }
+        )
 
 
 class CenterlineHintWorker(QObject):
@@ -4062,7 +5795,12 @@ class MainWindow(QMainWindow):
         self._last_trim_preview: ClusterTrimPreview | None = None
         self._last_distribution_preview: DistributionPreview | SpineReviewPreview | None = None
         self._preferred_distribution_spine_id: int | None = None
+        self._preferred_distribution_target: tuple[int, int] | None = None
         self._preferred_spine_review_mode: str | None = None
+        self._distribution_queue_entries: list[dict[str, object]] = []
+        self._pending_distribution_preview_target: tuple[str, int, int] | None = None
+        self._last_distribution_preview_target: tuple[str, int, int] | None = None
+        self._pending_morphology_preview_target: tuple[int, int] | None = None
         self._spine_map_focus_only = False
         self._spine_map_current_id: int | None = None
         self._spine_map_dialogs: list[SpineMapDialog] = []
@@ -4080,6 +5818,11 @@ class MainWindow(QMainWindow):
         self._context_dialogs: list[ContextViewerDialog] = []
         self._area_dialog: AreaSelectionDialog | None = None
         self._preview_requested_while_busy = False
+        self._pending_detection_after_preprocess: int | None = None
+        self._pending_detection_ready: int | None = None
+        self._pending_cluster_detection_after_preprocess = False
+        self._pending_cluster_detection_ready = False
+        self._pending_review_after_detection: int | None = None
         self._preprocess_view_specimen_key: tuple[int, int] | None = None
         self._detection_view_specimen_key: tuple[int, int] | None = None
         self._review_view_specimen_key: tuple[int, int] | None = None
@@ -4128,6 +5871,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.cluster_export_action)
 
         self.save_action = QAction("Save project", self)
+        self.save_action.setShortcut("Ctrl+S")
         self.save_action.triggered.connect(self._save_project)
         file_menu.addAction(self.save_action)
         file_menu.addSeparator()
@@ -4451,8 +6195,9 @@ class MainWindow(QMainWindow):
     def _build_interface(self) -> None:
         central = QWidget()
         central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(4, 4, 4, 4)
         self.tabs = QTabWidget()
-        central_layout.addWidget(self.tabs)
+        central_layout.addWidget(self.tabs, 1)
         setup_tab = QWidget()
         outer = QVBoxLayout(setup_tab)
 
@@ -4542,15 +6287,52 @@ class MainWindow(QMainWindow):
         self.summary_label.setWordWrap(True)
         outer.addWidget(self.summary_label)
 
-        self.table = QTableWidget(0, 8)
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("Assign experimental group:"))
+        self.manual_group_name = QComboBox()
+        self.manual_group_name.setEditable(True)
+        self.manual_group_name.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.manual_group_name.setToolTip(
+            "Type a new group name or choose an existing one, select one or more "
+            "specimen rows below, then assign them together."
+        )
+        group_row.addWidget(self.manual_group_name, 1)
+        self.assign_group_button = QPushButton("Assign to selected specimens")
+        self.assign_group_button.clicked.connect(
+            self._assign_selected_specimens_to_group
+        )
+        group_row.addWidget(self.assign_group_button)
+        outer.addLayout(group_row)
+
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
             ["Status", "Experimental group", "Specimen", "ChanA", "ChanB", "Shape (Z × Y × X)", "Type", "Issues"]
         )
+        for column, label in enumerate(
+            (
+                "Status",
+                "Experimental group",
+                "Specimen",
+                "Neuron / subject ID",
+                "ChanA",
+                "ChanB",
+                "Shape (Z x Y x X)",
+                "Type",
+                "Issues",
+            )
+        ):
+            self.table.setHorizontalHeaderItem(column, QTableWidgetItem(label))
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         outer.addWidget(self.table, 1)
 
         progress_row = QHBoxLayout()
@@ -4569,23 +6351,41 @@ class MainWindow(QMainWindow):
         self._build_measurements_tab()
         self._build_morphology_tab()
         self._build_advanced_clustering_tab()
+        self._build_calcium_tab()
+        self.tabs.currentChanged.connect(self._workflow_tab_changed)
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
         self.tabs.setTabEnabled(3, False)
         self.tabs.setTabEnabled(4, False)
         self.tabs.setTabEnabled(5, False)
         self.tabs.setTabEnabled(6, False)
-        save_row = QHBoxLayout()
-        save_row.addStretch(1)
+        self.tabs.setTabEnabled(7, False)
         self.save_button = QPushButton("Save project…")
         self.save_button.setToolTip(
             "Save the project from any workflow step. Unapplied processing and correction controls are not committed."
         )
         self.save_button.clicked.connect(self._save_project)
-        save_row.addWidget(self.save_button)
-        central_layout.addLayout(save_row)
+        self.tabs.setCornerWidget(
+            self.save_button, Qt.Corner.TopRightCorner
+        )
         self.setCentralWidget(central)
         self._build_context_status_line()
+
+    def _workflow_tab_changed(self, index: int) -> None:
+        if (
+            index == 4
+            and self.manifest is not None
+            and self.distribution_spine.count()
+            and self._job_thread is None
+        ):
+            current = self._current_distribution_target()
+            expected = (
+                (self._current_spine_review_mode(), current[0], current[1])
+                if current is not None
+                else None
+            )
+            if expected is not None and expected != self._last_distribution_preview_target:
+                self._distribution_spine_changed()
 
     def _build_context_status_line(self) -> None:
         self.context_status_widget = QWidget()
@@ -4767,12 +6567,19 @@ class MainWindow(QMainWindow):
         self.run_preprocessing_button.clicked.connect(self._run_batch_preprocessing)
         batch_row.addWidget(self.run_preprocessing_button)
         self.run_selected_preprocessing_button = QPushButton(
-            "Preprocess selected specimen"
+            "Preprocess selected channel"
         )
         self.run_selected_preprocessing_button.clicked.connect(
             self._run_selected_preprocessing
         )
         batch_row.addWidget(self.run_selected_preprocessing_button)
+        self.run_selected_specimen_preprocessing_button = QPushButton(
+            "Preprocess selected specimen"
+        )
+        self.run_selected_specimen_preprocessing_button.clicked.connect(
+            self._run_selected_specimen_preprocessing
+        )
+        batch_row.addWidget(self.run_selected_specimen_preprocessing_button)
         self.cancel_preprocessing_button = QPushButton("Cancel after current slice")
         self.cancel_preprocessing_button.clicked.connect(
             self._cancel_batch_preprocessing
@@ -5756,7 +7563,7 @@ class MainWindow(QMainWindow):
         feature_widget = QWidget()
         feature_layout = QVBoxLayout(feature_widget)
         feature_layout.setContentsMargins(0, 0, 0, 0)
-        for key, (label, _column) in MORPHOLOGY_FEATURES.items():
+        for key, (label, _column) in STANDARD_MORPHOLOGY_FEATURES.items():
             checkbox = QCheckBox(label)
             checkbox.setChecked(key in DEFAULT_FEATURES)
             self.morphology_features[key] = checkbox
@@ -5907,7 +7714,12 @@ class MainWindow(QMainWindow):
         self.morphology_metrics = QLabel("")
         self.morphology_metrics.setWordWrap(True)
         geometry_layout.addWidget(self.morphology_metrics)
-        self.morphology_display_tabs.addTab(geometry_page, "Geometry review")
+        self.morphology_geometry_scroll = _scrollable_clustering_page(
+            geometry_page
+        )
+        self.morphology_display_tabs.addTab(
+            self.morphology_geometry_scroll, "Geometry review"
+        )
         plots_page = QWidget()
         plots_layout = QVBoxLayout(plots_page)
         self.morphology_plot_mode = QComboBox()
@@ -5990,19 +7802,54 @@ class MainWindow(QMainWindow):
         legend_row.addWidget(self.morphology_legend_position)
         legend_row.addStretch(1)
         plots_layout.addLayout(legend_row)
+        plots_layout.addWidget(QLabel("Visible experimental groups (scatter plots only):"))
+        self.morphology_visible_groups = QListWidget()
+        self.morphology_visible_groups.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.morphology_visible_groups.setToolTip(
+            "Click one group to isolate it; Ctrl-click to show several. This changes "
+            "scatter display only, not clustering or statistics."
+        )
+        self.morphology_visible_groups.setMaximumHeight(80)
+        self.morphology_visible_groups.itemSelectionChanged.connect(
+            self._save_morphology_plot_style
+        )
+        plots_layout.addWidget(self.morphology_visible_groups)
         self.morphology_plot = MorphologyPlotCanvas()
         plots_layout.addWidget(self.morphology_plot, 1)
-        self.morphology_display_tabs.addTab(plots_page, "Interactive clustering plots")
-        self.morphology_cluster_score_panel = ClusterCountScorePanel()
+        self.morphology_plots_scroll = _scrollable_clustering_page(plots_page)
         self.morphology_display_tabs.addTab(
-            self.morphology_cluster_score_panel, "Cluster-count scores"
+            self.morphology_plots_scroll, "Interactive clustering plots"
+        )
+        self.morphology_cluster_score_panel = ClusterCountScorePanel()
+        self.morphology_cluster_score_scroll = _scrollable_clustering_page(
+            self.morphology_cluster_score_panel
+        )
+        self.morphology_display_tabs.addTab(
+            self.morphology_cluster_score_scroll, "Cluster-count scores"
         )
         self.morphology_correlation_panel = CorrelationMatrixPanel()
         self.morphology_correlation_panel.settings_changed.connect(
             self._save_morphology_correlation_settings
         )
+        self.morphology_correlation_scroll = _scrollable_clustering_page(
+            self.morphology_correlation_panel
+        )
         self.morphology_display_tabs.addTab(
-            self.morphology_correlation_panel, "Feature correlations"
+            self.morphology_correlation_scroll, "Feature correlations"
+        )
+        self.morphology_statistics_panel = ClusterStatisticsPanel(
+            MORPHOLOGY_FEATURES
+        )
+        self.morphology_statistics_panel.statistics_changed.connect(
+            self._save_morphology_statistics
+        )
+        self.morphology_statistics_scroll = _scrollable_clustering_page(
+            self.morphology_statistics_panel
+        )
+        self.morphology_display_tabs.addTab(
+            self.morphology_statistics_scroll, "Group statistics"
         )
         output_layout.addWidget(self.morphology_display_tabs, 1)
         splitter.addWidget(output)
@@ -6053,15 +7900,50 @@ class MainWindow(QMainWindow):
         feature_widget = QWidget()
         feature_layout = QGridLayout(feature_widget)
         feature_layout.setContentsMargins(0, 0, 0, 0)
-        for index, (key, (label, _column)) in enumerate(MORPHOLOGY_FEATURES.items()):
+        for index, (key, (label, _column)) in enumerate(
+            STANDARD_MORPHOLOGY_FEATURES.items()
+        ):
             checkbox = QCheckBox(label)
             checkbox.setChecked(key in DEFAULT_FEATURES)
             self.advanced_features[key] = checkbox
             feature_layout.addWidget(checkbox, index // 2, index % 2)
         form.addRow("Morphology features:", feature_widget)
+
+        inclusive_widget = QWidget()
+        inclusive_layout = QGridLayout(inclusive_widget)
+        inclusive_layout.setContentsMargins(0, 0, 0, 0)
+        for index, (key, (label, _column)) in enumerate(
+            INCLUSIVE_CLUSTERING_FEATURES.items()
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(False)
+            self.advanced_features[key] = checkbox
+            inclusive_layout.addWidget(checkbox, index // 2, index % 2)
+        form.addRow("Optional multimodal inputs:", inclusive_widget)
+        self.advanced_calcium_dataset = QComboBox()
+        self.advanced_calcium_dataset.addItem("No calcium dataset", "")
+        self.advanced_calcium_dataset.setToolTip(
+            "Use one calcium experiment, or combine all imported experiments when "
+            "their registered spines belong to different Synpo specimens."
+        )
+        form.addRow("Calcium dataset:", self.advanced_calcium_dataset)
+        calcium_states = QWidget()
+        calcium_states_layout = QHBoxLayout(calcium_states)
+        calcium_states_layout.setContentsMargins(0, 0, 0, 0)
+        self.advanced_calcium_confirmed = QCheckBox("Confirmed")
+        self.advanced_calcium_confirmed.setChecked(True)
+        self.advanced_calcium_probable = QCheckBox("Probable")
+        self.advanced_calcium_ambiguous = QCheckBox("Ambiguous")
+        calcium_states_layout.addWidget(self.advanced_calcium_confirmed)
+        calcium_states_layout.addWidget(self.advanced_calcium_probable)
+        calcium_states_layout.addWidget(self.advanced_calcium_ambiguous)
+        calcium_states_layout.addStretch(1)
+        form.addRow("Accepted calcium matches:", calcium_states)
         protein_note = QLabel(
-            "Protein puncta remain descriptive outputs only; they never influence "
-            "the nonlinear embedding or cluster assignments."
+            "Protein and calcium measurements are optional clustering inputs only in "
+            "this Advanced tab. Selecting calcium inputs restricts the run to matched "
+            "spines with the chosen review states; unmatched higher-magnification Synpo "
+            "spines are reported in the exclusion audit."
         )
         protein_note.setWordWrap(True)
         form.addRow(protein_note)
@@ -6285,24 +8167,63 @@ class MainWindow(QMainWindow):
         )
         plot_row.addWidget(self.advanced_legend_position)
         advanced_plots_layout.addLayout(plot_row)
+        advanced_plots_layout.addWidget(
+            QLabel("Visible experimental groups (scatter plots only):")
+        )
+        self.advanced_visible_groups = QListWidget()
+        self.advanced_visible_groups.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.advanced_visible_groups.setToolTip(
+            "Click one group to isolate it; Ctrl-click to show several. This changes "
+            "scatter display only, not clustering or statistics."
+        )
+        self.advanced_visible_groups.setMaximumHeight(80)
+        self.advanced_visible_groups.itemSelectionChanged.connect(
+            self._save_advanced_plot_style
+        )
+        advanced_plots_layout.addWidget(self.advanced_visible_groups)
         self.advanced_diagnostics = QLabel("")
         self.advanced_diagnostics.setWordWrap(True)
         advanced_plots_layout.addWidget(self.advanced_diagnostics)
         self.advanced_plot = MorphologyPlotCanvas()
         advanced_plots_layout.addWidget(self.advanced_plot, 1)
+        self.advanced_plots_scroll = _scrollable_clustering_page(
+            advanced_plots_page
+        )
         self.advanced_display_tabs.addTab(
-            advanced_plots_page, "Interactive clustering plots"
+            self.advanced_plots_scroll, "Interactive clustering plots"
         )
         self.advanced_cluster_score_panel = ClusterCountScorePanel()
-        self.advanced_display_tabs.addTab(
-            self.advanced_cluster_score_panel, "Cluster-count scores"
+        self.advanced_cluster_score_scroll = _scrollable_clustering_page(
+            self.advanced_cluster_score_panel
         )
-        self.advanced_correlation_panel = CorrelationMatrixPanel()
+        self.advanced_display_tabs.addTab(
+            self.advanced_cluster_score_scroll, "Cluster-count scores"
+        )
+        self.advanced_correlation_panel = CorrelationMatrixPanel(
+            MORPHOLOGY_FEATURES
+        )
         self.advanced_correlation_panel.settings_changed.connect(
             self._save_advanced_correlation_settings
         )
+        self.advanced_correlation_scroll = _scrollable_clustering_page(
+            self.advanced_correlation_panel
+        )
         self.advanced_display_tabs.addTab(
-            self.advanced_correlation_panel, "Feature correlations"
+            self.advanced_correlation_scroll, "Feature correlations"
+        )
+        self.advanced_statistics_panel = ClusterStatisticsPanel(
+            MORPHOLOGY_FEATURES
+        )
+        self.advanced_statistics_panel.statistics_changed.connect(
+            self._save_advanced_statistics
+        )
+        self.advanced_statistics_scroll = _scrollable_clustering_page(
+            self.advanced_statistics_panel
+        )
+        self.advanced_display_tabs.addTab(
+            self.advanced_statistics_scroll, "Group statistics"
         )
         output_layout.addWidget(self.advanced_display_tabs, 1)
         splitter.addWidget(output)
@@ -6311,6 +8232,2028 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "7. Advanced clustering")
         self._advanced_reduction_changed()
         self._cluster_count_controls_changed()
+
+    def _build_calcium_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        dataset_group = QGroupBox("Calcium-imaging dataset")
+        dataset_layout = QGridLayout(dataset_group)
+        dataset_layout.addWidget(QLabel("Dataset:"), 0, 0)
+        self.calcium_dataset = QComboBox()
+        self.calcium_dataset.currentIndexChanged.connect(
+            self._calcium_dataset_changed
+        )
+        dataset_layout.addWidget(self.calcium_dataset, 0, 1, 1, 3)
+        import_button = QPushButton("Add calcium result folder(s)…")
+        import_button.clicked.connect(self._import_calcium_results)
+        self.calcium_import_button = import_button
+        dataset_layout.addWidget(import_button, 0, 4)
+        relink_button = QPushButton("Relink results folder…")
+        relink_button.clicked.connect(self._relink_calcium_results)
+        self.calcium_relink_button = relink_button
+        dataset_layout.addWidget(relink_button, 0, 5)
+        self.calcium_dataset_status = QLabel(
+            "Import a calcium results folder after Synpo measurements are complete."
+        )
+        self.calcium_dataset_status.setWordWrap(True)
+        dataset_layout.addWidget(self.calcium_dataset_status, 1, 0, 1, 6)
+        layout.addWidget(dataset_group)
+
+        self.calcium_pages = QTabWidget()
+        layout.addWidget(self.calcium_pages, 1)
+
+        registration_page = QWidget()
+        registration_layout = QVBoxLayout(registration_page)
+        registration_controls = QGridLayout()
+        registration_controls.addWidget(QLabel("Calcium specimen:"), 0, 0)
+        self.calcium_recording = QComboBox()
+        self.calcium_recording.currentIndexChanged.connect(
+            self._calcium_registration_pair_changed
+        )
+        registration_controls.addWidget(self.calcium_recording, 0, 1)
+        registration_controls.addWidget(QLabel("Synpo image/field:"), 0, 2)
+        self.calcium_synpo_specimen = QComboBox()
+        self.calcium_synpo_specimen.currentIndexChanged.connect(
+            self._calcium_registration_pair_changed
+        )
+        registration_controls.addWidget(self.calcium_synpo_specimen, 0, 3)
+        registration_controls.addWidget(QLabel("Transform:"), 0, 4)
+        self.calcium_transform_model = QComboBox()
+        self.calcium_transform_model.addItem(
+            "Similarity (rotation/reflection/scale)", "similarity"
+        )
+        self.calcium_transform_model.addItem("Affine", "affine")
+        self.calcium_transform_model.addItem(
+            "Piecewise landmark warp", "piecewise"
+        )
+        self.calcium_transform_model.setCurrentIndex(1)
+        registration_controls.addWidget(self.calcium_transform_model, 0, 5)
+        self.calcium_registration_summary = QLabel("No field registration saved.")
+        self.calcium_registration_summary.setWordWrap(True)
+        registration_controls.addWidget(
+            self.calcium_registration_summary, 1, 0, 1, 6
+        )
+        registration_layout.addLayout(registration_controls)
+
+        registration_actions = QHBoxLayout()
+        undo_landmark = QPushButton("Undo last landmark pair")
+        undo_landmark.clicked.connect(self._undo_calcium_landmark)
+        registration_actions.addWidget(undo_landmark)
+        clear_landmarks = QPushButton("Clear landmarks")
+        clear_landmarks.clicked.connect(self._clear_calcium_landmarks)
+        registration_actions.addWidget(clear_landmarks)
+        save_registration = QPushButton("Save / update field registration")
+        save_registration.clicked.connect(self._save_calcium_registration)
+        self.calcium_save_registration_button = save_registration
+        registration_actions.addWidget(save_registration)
+        remove_button = QPushButton("Remove this field registration")
+        remove_button.clicked.connect(self._remove_calcium_registration)
+        registration_actions.addWidget(remove_button)
+        registration_actions.addStretch(1)
+        registration_layout.addLayout(registration_actions)
+        registration_note = QLabel(
+            "Click the same landmark first in the calcium image (left), then in the "
+            "corresponding Synpo field (right). Add the same calcium specimen to "
+            "several Synpo fields by selecting and registering each field separately. "
+            "Each view has independent zoom and pan. Turn on Pan for left-button "
+            "dragging, or middle-drag at any time."
+        )
+        registration_note.setWordWrap(True)
+        registration_layout.addWidget(registration_note)
+
+        image_splitter = QSplitter(Qt.Orientation.Horizontal)
+        calcium_image_panel = QWidget()
+        calcium_image_layout = QVBoxLayout(calcium_image_panel)
+        calcium_image_layout.addWidget(QLabel("Calcium cytoplasm projection + ROIs"))
+        self.calcium_registration_view = CalciumRegistrationView(
+            "Select a calcium specimen"
+        )
+        self.calcium_registration_view.point_clicked.connect(
+            self._calcium_landmark_clicked
+        )
+        calcium_image_layout.addWidget(self.calcium_registration_view, 1)
+        self.calcium_registration_zoom_controls = ZoomControls(
+            self.calcium_registration_view, show_pan_button=True
+        )
+        calcium_image_layout.addWidget(self.calcium_registration_zoom_controls)
+        self.calcium_registration_tone_controls = CalciumToneControls()
+        self.calcium_registration_tone_controls.tone_changed.connect(
+            self.calcium_registration_view.set_calcium_tone_adjustments
+        )
+        calcium_image_layout.addWidget(self.calcium_registration_tone_controls)
+        image_splitter.addWidget(calcium_image_panel)
+        synpo_image_panel = QWidget()
+        synpo_image_layout = QVBoxLayout(synpo_image_panel)
+        synpo_image_layout.addWidget(QLabel("Synpo maximum projection + object labels"))
+        self.calcium_synpo_view = CalciumRegistrationView(
+            "Select a measured Synpo image"
+        )
+        self.calcium_synpo_view.point_clicked.connect(
+            self._synpo_landmark_clicked
+        )
+        synpo_image_layout.addWidget(self.calcium_synpo_view, 1)
+        self.calcium_synpo_zoom_controls = ZoomControls(
+            self.calcium_synpo_view, show_pan_button=True
+        )
+        synpo_image_layout.addWidget(self.calcium_synpo_zoom_controls)
+        image_splitter.addWidget(synpo_image_panel)
+        image_splitter.setSizes([650, 650])
+        self._calcium_linking_views = False
+        registration_layout.addWidget(image_splitter, 1)
+        self.calcium_landmark_table = QTableWidget(0, 5)
+        self.calcium_landmark_table.setHorizontalHeaderLabels(
+            ["Pair", "Calcium X", "Calcium Y", "Synpo X", "Synpo Y"]
+        )
+        self.calcium_landmark_table.verticalHeader().setVisible(False)
+        self.calcium_landmark_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.calcium_landmark_table.setMaximumHeight(155)
+        self.calcium_landmark_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        registration_layout.addWidget(self.calcium_landmark_table)
+        self.calcium_pages.addTab(registration_page, "1. Register images")
+
+        match_page = QWidget()
+        match_layout = QVBoxLayout(match_page)
+        match_actions = QGridLayout()
+        match_actions.addWidget(QLabel("Maximum distance:"), 0, 0)
+        self.calcium_match_distance = QDoubleSpinBox()
+        self.calcium_match_distance.setRange(1.0, 500.0)
+        self.calcium_match_distance.setValue(30.0)
+        self.calcium_match_distance.setSuffix(" Synpo px")
+        match_actions.addWidget(self.calcium_match_distance, 0, 1)
+        auto_button = QPushButton("Generate / refresh automatic proposals")
+        auto_button.clicked.connect(self._run_calcium_automatch)
+        self.calcium_automatch_button = auto_button
+        match_actions.addWidget(auto_button, 0, 2)
+        confirm_all = QPushButton("Confirm all current proposals")
+        confirm_all.clicked.connect(self._confirm_all_calcium_matches)
+        match_actions.addWidget(confirm_all, 0, 3)
+        ignore_all = QPushButton("Ignore all unmatched calcium ROIs")
+        ignore_all.clicked.connect(self._ignore_all_unmatched_calcium)
+        match_actions.addWidget(ignore_all, 0, 4)
+        match_actions.addWidget(QLabel("Show:"), 1, 0)
+        self.calcium_match_filter = QComboBox()
+        self.calcium_match_filter.addItem("All calcium ROIs", "all")
+        for state in ("unreviewed", "confirmed", "probable", "ambiguous", "ignored", "unmatched"):
+            self.calcium_match_filter.addItem(state.title(), state)
+        self.calcium_match_filter.currentIndexChanged.connect(
+            self._refresh_calcium_match_table
+        )
+        match_actions.addWidget(self.calcium_match_filter, 1, 1)
+        self.calcium_match_status = QLabel("No match proposals yet.")
+        self.calcium_match_status.setWordWrap(True)
+        match_actions.addWidget(self.calcium_match_status, 1, 2, 1, 3)
+        match_layout.addLayout(match_actions)
+
+        self.calcium_match_table = QTableWidget(0, 13)
+        self.calcium_match_table.setHorizontalHeaderLabels(
+            [
+                "State", "Calcium specimen", "Spine ROI", "Parent segment",
+                "Peak ΔF/F0", "Pearson r", "Synpo group", "Synpo specimen",
+                "Synpo dendrite", "Synpo spine", "Distance px", "Auto confidence", "Note",
+            ]
+        )
+        self.calcium_match_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.calcium_match_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.calcium_match_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.calcium_match_table.itemSelectionChanged.connect(
+            self._calcium_match_selection_changed
+        )
+        self.calcium_match_table.verticalHeader().setVisible(False)
+        match_header = self.calcium_match_table.horizontalHeader()
+        match_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        match_header.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        self.calcium_match_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.calcium_match_splitter.addWidget(self.calcium_match_table)
+
+        match_visual_panel = QWidget()
+        match_visual_layout = QVBoxLayout(match_visual_panel)
+        match_visual_layout.setContentsMargins(0, 4, 0, 0)
+        self.calcium_match_visual_status = QLabel(
+            "Select a calcium ROI to inspect its proposed alignment."
+        )
+        self.calcium_match_visual_status.setWordWrap(True)
+        match_visual_layout.addWidget(self.calcium_match_visual_status)
+        match_view_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        calcium_match_panel = QWidget()
+        calcium_match_layout = QVBoxLayout(calcium_match_panel)
+        calcium_match_layout.setContentsMargins(0, 0, 0, 0)
+        calcium_match_title = QLabel(
+            "Calcium image — selected spine ROI yellow; parent segment cyan"
+        )
+        calcium_match_title.setWordWrap(True)
+        calcium_match_layout.addWidget(calcium_match_title)
+        self.calcium_match_calcium_view = CalciumMatchReviewView(
+            "Select a calcium ROI"
+        )
+        calcium_match_layout.addWidget(self.calcium_match_calcium_view, 1)
+        self.calcium_match_calcium_zoom_controls = ZoomControls(
+            self.calcium_match_calcium_view, show_pan_button=True
+        )
+        calcium_match_layout.addWidget(
+            self.calcium_match_calcium_zoom_controls
+        )
+        self.calcium_match_tone_controls = CalciumToneControls()
+        self.calcium_match_tone_controls.tone_changed.connect(
+            self.calcium_match_calcium_view.set_calcium_tone_adjustments
+        )
+        calcium_match_layout.addWidget(self.calcium_match_tone_controls)
+        match_view_splitter.addWidget(calcium_match_panel)
+
+        synpo_match_panel = QWidget()
+        synpo_match_layout = QVBoxLayout(synpo_match_panel)
+        synpo_match_layout.setContentsMargins(0, 0, 0, 0)
+        synpo_match_title = QLabel(
+            "Aligned Synpo view — calcium ROI yellow/cyan; matched spine magenta; "
+            "matched dendrite green. Click a spine to assign it."
+        )
+        synpo_match_title.setWordWrap(True)
+        synpo_match_layout.addWidget(synpo_match_title)
+        self.calcium_match_synpo_view = CalciumMatchReviewView(
+            "A matched ROI and saved registration are needed"
+        )
+        self.calcium_match_synpo_view.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.calcium_match_synpo_view.setToolTip(
+            "Click a Synpo spine to assign it to the selected calcium ROI. "
+            "Enable Pan before left-dragging."
+        )
+        self.calcium_match_synpo_view.spine_clicked.connect(
+            self._calcium_synpo_spine_clicked
+        )
+        synpo_match_layout.addWidget(self.calcium_match_synpo_view, 1)
+        self.calcium_match_synpo_zoom_controls = ZoomControls(
+            self.calcium_match_synpo_view, show_pan_button=True
+        )
+        synpo_match_layout.addWidget(self.calcium_match_synpo_zoom_controls)
+        match_view_splitter.addWidget(synpo_match_panel)
+        match_view_splitter.setSizes([650, 650])
+        match_visual_layout.addWidget(match_view_splitter, 1)
+
+        self.calcium_match_splitter.addWidget(match_visual_panel)
+        self.calcium_match_splitter.setSizes([200, 560])
+        match_layout.addWidget(self.calcium_match_splitter, 1)
+
+        review_actions = QHBoxLayout()
+        for label, state in (
+            ("Confirm and advance", "confirmed"),
+            ("Mark probable", "probable"),
+            ("Mark ambiguous", "ambiguous"),
+            ("Ignore ROI", "ignored"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, value=state: self._review_selected_calcium_match(value)
+            )
+            review_actions.addWidget(button)
+        clear_match = QPushButton("Clear match")
+        clear_match.clicked.connect(self._clear_selected_calcium_match)
+        review_actions.addWidget(clear_match)
+        review_actions.addWidget(QLabel("Note:"))
+        self.calcium_match_note = QLineEdit()
+        review_actions.addWidget(self.calcium_match_note, 1)
+        match_layout.addLayout(review_actions)
+
+        manual_group = QGroupBox(
+            "Manual match: click a Synpo spine or enter its ID"
+        )
+        manual_layout = QHBoxLayout(manual_group)
+        manual_layout.addWidget(QLabel("Synpo specimen:"))
+        self.calcium_manual_specimen = QComboBox()
+        self.calcium_manual_specimen.currentIndexChanged.connect(
+            self._calcium_manual_specimen_changed
+        )
+        manual_layout.addWidget(self.calcium_manual_specimen, 1)
+        manual_layout.addWidget(QLabel("Spine ID:"))
+        self.calcium_manual_spine = QSpinBox()
+        self.calcium_manual_spine.setRange(1, 10_000_000)
+        manual_layout.addWidget(self.calcium_manual_spine)
+        manual_button = QPushButton("Assign selected calcium ROI and confirm")
+        manual_button.clicked.connect(self._assign_manual_calcium_match)
+        manual_layout.addWidget(manual_button)
+        match_layout.addWidget(manual_group)
+        self.calcium_pages.addTab(match_page, "2. Review spine matches")
+
+        analysis_page = QWidget()
+        analysis_layout = QVBoxLayout(analysis_page)
+        analysis_controls = QGridLayout()
+        analysis_controls.addWidget(QLabel("Saved calcium analysis:"), 0, 0)
+        self.calcium_saved_analysis = QComboBox()
+        self.calcium_saved_analysis.currentIndexChanged.connect(
+            self._calcium_saved_analysis_changed
+        )
+        analysis_controls.addWidget(self.calcium_saved_analysis, 0, 1)
+        analysis_controls.addWidget(QLabel("Run name:"), 0, 2)
+        self.calcium_analysis_name = QLineEdit("Calcium-puncta dependency")
+        analysis_controls.addWidget(self.calcium_analysis_name, 0, 3)
+        analysis_controls.addWidget(QLabel("Morphology clustering run:"), 1, 0)
+        self.calcium_morphology_run = QComboBox()
+        self.calcium_morphology_run.currentIndexChanged.connect(
+            self._prepare_calcium_groups
+        )
+        analysis_controls.addWidget(self.calcium_morphology_run, 1, 1, 1, 3)
+        analysis_controls.addWidget(QLabel("X metric:"), 2, 0)
+        self.calcium_x_metric = QComboBox()
+        for label, key in (
+            ("Protein puncta total volume", "protein_puncta_total_volume_um3"),
+            ("Protein puncta count", "protein_puncta_count"),
+            ("Protein puncta / spine volume", "protein_puncta_to_spine_volume_ratio"),
+            ("Protein puncta shaft-to-tip centroid", "protein_puncta_axis_centroid_fraction"),
+            ("Spine volume", "volume_um3"),
+        ):
+            self.calcium_x_metric.addItem(label, key)
+        analysis_controls.addWidget(self.calcium_x_metric, 2, 1)
+        analysis_controls.addWidget(QLabel("Y calcium metric:"), 2, 2)
+        self.calcium_y_metric = QComboBox()
+        self.calcium_y_metric.addItem("Spine peak ΔF/F0", "calcium_spine_peak_dff")
+        self.calcium_y_metric.addItem("Spine-parent Pearson r", "calcium_pearson_r")
+        analysis_controls.addWidget(self.calcium_y_metric, 2, 3)
+        analysis_controls.addWidget(QLabel("Accepted matches:"), 3, 0)
+        accepted_widget = QWidget()
+        accepted_layout = QHBoxLayout(accepted_widget)
+        accepted_layout.setContentsMargins(0, 0, 0, 0)
+        self.calcium_use_confirmed = QCheckBox("Confirmed")
+        self.calcium_use_confirmed.setChecked(True)
+        self.calcium_use_probable = QCheckBox("Probable")
+        self.calcium_use_ambiguous = QCheckBox("Ambiguous")
+        accepted_layout.addWidget(self.calcium_use_confirmed)
+        accepted_layout.addWidget(self.calcium_use_probable)
+        accepted_layout.addWidget(self.calcium_use_ambiguous)
+        accepted_layout.addStretch(1)
+        analysis_controls.addWidget(accepted_widget, 3, 1, 1, 3)
+        analysis_controls.addWidget(QLabel("Experimental groups:"), 4, 0)
+        self.calcium_analysis_groups = QListWidget()
+        self.calcium_analysis_groups.setSelectionMode(
+            QAbstractItemView.SelectionMode.MultiSelection
+        )
+        self.calcium_analysis_groups.setMaximumHeight(85)
+        analysis_controls.addWidget(self.calcium_analysis_groups, 4, 1, 1, 3)
+        style_widget = QWidget()
+        style_layout = QHBoxLayout(style_widget)
+        style_layout.setContentsMargins(0, 0, 0, 0)
+        self.calcium_log_x = QCheckBox("Log/symlog X")
+        self.calcium_log_y = QCheckBox("Log/symlog Y")
+        self.calcium_show_regression = QCheckBox("Regression per cluster")
+        self.calcium_show_regression.setChecked(True)
+        self.calcium_point_alpha = QDoubleSpinBox()
+        self.calcium_point_alpha.setRange(0.0, 1.0)
+        self.calcium_point_alpha.setValue(0.72)
+        self.calcium_point_alpha.setSingleStep(0.05)
+        style_layout.addWidget(self.calcium_log_x)
+        style_layout.addWidget(self.calcium_log_y)
+        style_layout.addWidget(self.calcium_show_regression)
+        style_layout.addWidget(QLabel("Point alpha:"))
+        style_layout.addWidget(self.calcium_point_alpha)
+        style_layout.addStretch(1)
+        analysis_controls.addWidget(style_widget, 5, 0, 1, 4)
+        action_widget = QWidget()
+        action_layout = QHBoxLayout(action_widget)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        update_plot = QPushButton("Update calcium dependency plot")
+        update_plot.clicked.connect(self._render_calcium_analysis)
+        action_layout.addWidget(update_plot)
+        save_analysis = QPushButton("Save / replace named analysis")
+        save_analysis.clicked.connect(self._save_named_calcium_analysis)
+        self.calcium_save_analysis_button = save_analysis
+        action_layout.addWidget(save_analysis)
+        export_analysis = QPushButton("Export calcium matching analysis…")
+        export_analysis.clicked.connect(self._export_calcium_analysis)
+        self.calcium_export_button = export_analysis
+        action_layout.addWidget(export_analysis)
+        action_layout.addStretch(1)
+        analysis_controls.addWidget(action_widget, 6, 0, 1, 4)
+        analysis_layout.addLayout(analysis_controls)
+        self.calcium_analysis_status = QLabel(
+            "Confirm matches and select a saved morphology run to analyze calcium data."
+        )
+        self.calcium_analysis_status.setWordWrap(True)
+        analysis_layout.addWidget(self.calcium_analysis_status)
+        self.calcium_figure = Figure(figsize=(8.5, 5.5), tight_layout=True)
+        self.calcium_plot = FigureCanvasQTAgg(self.calcium_figure)
+        self.calcium_plot.setMinimumSize(560, 380)
+        analysis_layout.addWidget(self.calcium_plot, 1)
+        self.calcium_statistics_table = QTableWidget(0, 8)
+        self.calcium_statistics_table.setHorizontalHeaderLabels(
+            [
+                "Cluster", "Spines", "Specimens", "Pearson r", "Pearson p",
+                "Spearman ρ", "Bootstrap r 95% CI", "Regression slope",
+            ]
+        )
+        self.calcium_statistics_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.calcium_statistics_table.verticalHeader().setVisible(False)
+        self.calcium_statistics_table.setMaximumHeight(210)
+        self.calcium_statistics_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        analysis_layout.addWidget(self.calcium_statistics_table)
+        self.calcium_analysis_scroll = _scrollable_clustering_page(analysis_page)
+        self.calcium_pages.addTab(
+            self.calcium_analysis_scroll, "3. Cluster calcium analysis"
+        )
+
+        self._active_calcium_dataset: dict[str, object] | None = None
+        self._calcium_scene_cache: dict[int, dict[str, object]] = {}
+        self._pending_calcium_match_uid: str | None = None
+        self._calcium_landmarks_source: list[tuple[float, float]] = []
+        self._calcium_landmarks_target: list[tuple[float, float]] = []
+        self.tabs.addTab(tab, "8. Calcium matching")
+
+    def _prepare_calcium_tab(self) -> None:
+        measured: list[int] = []
+        if self.manifest is not None:
+            measured = [
+                index
+                for index, specimen in enumerate(self.manifest.get("specimens", []))
+                if specimen.get("checkpoints", {}).get("measurements", {}).get("state")
+                == "complete"
+            ]
+        self.tabs.setTabEnabled(7, bool(measured))
+        current_dataset = self.calcium_dataset.currentData()
+        active_dataset = (
+            self.manifest.get("calcium_analysis", {}).get("active_dataset_id")
+            if self.manifest is not None
+            else None
+        )
+        self.calcium_dataset.blockSignals(True)
+        self.calcium_dataset.clear()
+        if self.manifest is not None:
+            for record in self.manifest.get("calcium_analysis", {}).get("datasets", []):
+                reviewed = int(record.get("reviewed_match_count", 0))
+                total = int(record.get("spine_count", 0))
+                self.calcium_dataset.addItem(
+                    f"{record.get('name', 'Calcium dataset')} "
+                    f"[{reviewed}/{total} decisions]",
+                    record.get("dataset_id"),
+                )
+        desired = current_dataset or active_dataset
+        if desired is not None:
+            index = self.calcium_dataset.findData(desired)
+            if index >= 0:
+                self.calcium_dataset.setCurrentIndex(index)
+        self.calcium_dataset.blockSignals(False)
+
+        for combo in (self.calcium_synpo_specimen, self.calcium_manual_specimen):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            if self.manifest is not None:
+                for specimen_index in measured:
+                    specimen = self.manifest["specimens"][specimen_index]
+                    combo.addItem(
+                        f"{specimen['experimental_group']} — {specimen['specimen_id']}",
+                        specimen_index,
+                    )
+            if current is not None:
+                found = combo.findData(current)
+                if found >= 0:
+                    combo.setCurrentIndex(found)
+            combo.blockSignals(False)
+
+        current_run = self.calcium_morphology_run.currentData()
+        self.calcium_morphology_run.blockSignals(True)
+        self.calcium_morphology_run.clear()
+        if self.manifest is not None:
+            for record in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                suffix = " [stale—refit recommended]" if record.get("stale") else ""
+                self.calcium_morphology_run.addItem(
+                    f"{record.get('name', 'Morphology analysis')}{suffix}",
+                    record.get("run_id"),
+                )
+        if current_run is not None:
+            found = self.calcium_morphology_run.findData(current_run)
+            if found >= 0:
+                self.calcium_morphology_run.setCurrentIndex(found)
+        self.calcium_morphology_run.blockSignals(False)
+        if self.calcium_dataset.count():
+            self._calcium_dataset_changed()
+        else:
+            self._active_calcium_dataset = None
+            self.calcium_recording.clear()
+            self.calcium_saved_analysis.clear()
+            self._refresh_calcium_match_table()
+            self._prepare_calcium_groups()
+
+    def _selected_calcium_dataset_id(self) -> str | None:
+        value = self.calcium_dataset.currentData()
+        return str(value) if value else None
+
+    def _calcium_recording_value(self) -> dict[str, object] | None:
+        if self._active_calcium_dataset is None:
+            return None
+        recording_id = str(self.calcium_recording.currentData() or "")
+        return next(
+            (
+                row
+                for row in self._active_calcium_dataset.get("recordings", [])
+                if str(row.get("recording_id")) == recording_id
+            ),
+            None,
+        )
+
+    def _calcium_dataset_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None:
+            return
+        self._pending_calcium_match_uid = None
+        dataset_id = self._selected_calcium_dataset_id()
+        if not dataset_id:
+            self._active_calcium_dataset = None
+            return
+        try:
+            dataset = load_calcium_dataset(self.manifest, dataset_id)
+        except ValueError as exc:
+            self._active_calcium_dataset = None
+            self.calcium_dataset_status.setText(str(exc))
+            return
+        self._active_calcium_dataset = dataset
+        current_recording = self.calcium_recording.currentData()
+        self.calcium_recording.blockSignals(True)
+        self.calcium_recording.clear()
+        for recording in dataset.get("recordings", []):
+            included = sum(
+                bool(spine.get("source_included", True))
+                for spine in recording.get("spines", [])
+            )
+            self.calcium_recording.addItem(
+                f"{recording['recording_id']} [{included} included spine ROIs]",
+                recording["recording_id"],
+            )
+        if current_recording is not None:
+            found = self.calcium_recording.findData(current_recording)
+            if found >= 0:
+                self.calcium_recording.setCurrentIndex(found)
+        self.calcium_recording.blockSignals(False)
+        reviewed = sum(
+            str(row.get("review_state")) != "unreviewed"
+            for row in dataset.get("matches", [])
+        )
+        matched = sum(
+            row.get("synpo_spine_id") is not None for row in dataset.get("matches", [])
+        )
+        total = sum(
+            len(recording.get("spines", []))
+            for recording in dataset.get("recordings", [])
+        )
+        self.calcium_dataset_status.setText(
+            f"Experiment {dataset.get('experiment_label')}: "
+            f"{len(dataset.get('recordings', []))} calcium specimen(s), {total} spine "
+            f"ROIs, {len(dataset.get('registrations', []))} registered Synpo field(s), "
+            f"{matched} assigned and {reviewed} reviewed/ignored. Reference images are "
+            + (
+                "embedded for transfer."
+                if dataset.get("embedded_reference_images")
+                else "externally linked."
+            )
+        )
+        self._populate_calcium_metrics()
+        self._calcium_registration_pair_changed()
+        self._refresh_calcium_match_table()
+        self._prepare_calcium_groups()
+        self._prepare_calcium_saved_analyses()
+
+    def _prepare_calcium_saved_analyses(self) -> None:
+        current = self.calcium_saved_analysis.currentData()
+        active = (
+            self._active_calcium_dataset.get("active_analysis_run_id")
+            if self._active_calcium_dataset is not None
+            else None
+        )
+        self.calcium_saved_analysis.blockSignals(True)
+        self.calcium_saved_analysis.clear()
+        if self._active_calcium_dataset is not None:
+            for record in self._active_calcium_dataset.get("analysis_runs", []):
+                self.calcium_saved_analysis.addItem(
+                    str(record.get("name", "Calcium analysis")),
+                    record.get("run_id"),
+                )
+        desired = current or active
+        if desired:
+            found = self.calcium_saved_analysis.findData(desired)
+            if found >= 0:
+                self.calcium_saved_analysis.setCurrentIndex(found)
+        self.calcium_saved_analysis.blockSignals(False)
+        if self.calcium_saved_analysis.count():
+            self._calcium_saved_analysis_changed()
+
+    def _calcium_analysis_settings(self) -> dict[str, object]:
+        return {
+            "morphology_run_id": str(
+                self.calcium_morphology_run.currentData() or ""
+            ),
+            "accepted_match_states": list(
+                self._accepted_calcium_match_states()
+            ),
+            "x_metric": str(self.calcium_x_metric.currentData() or ""),
+            "calcium_metric": str(self.calcium_y_metric.currentData() or ""),
+            "included_groups": list(self._selected_calcium_groups()),
+            "point_alpha": self.calcium_point_alpha.value(),
+            "log_x": self.calcium_log_x.isChecked(),
+            "log_y": self.calcium_log_y.isChecked(),
+            "show_regression": self.calcium_show_regression.isChecked(),
+        }
+
+    def _calcium_saved_analysis_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self._active_calcium_dataset is None:
+            return
+        run_id = str(self.calcium_saved_analysis.currentData() or "")
+        record = next(
+            (
+                row
+                for row in self._active_calcium_dataset.get("analysis_runs", [])
+                if str(row.get("run_id")) == run_id
+            ),
+            None,
+        )
+        if record is None:
+            return
+        settings = dict(record.get("settings", {}))
+        self.calcium_analysis_name.setText(str(record.get("name", "")))
+        morphology_index = self.calcium_morphology_run.findData(
+            settings.get("morphology_run_id")
+        )
+        if morphology_index >= 0:
+            self.calcium_morphology_run.setCurrentIndex(morphology_index)
+        x_index = self.calcium_x_metric.findData(settings.get("x_metric"))
+        if x_index >= 0:
+            self.calcium_x_metric.setCurrentIndex(x_index)
+        y_index = self.calcium_y_metric.findData(settings.get("calcium_metric"))
+        if y_index >= 0:
+            self.calcium_y_metric.setCurrentIndex(y_index)
+        states = set(settings.get("accepted_match_states", ["confirmed"]))
+        self.calcium_use_confirmed.setChecked("confirmed" in states)
+        self.calcium_use_probable.setChecked("probable" in states)
+        self.calcium_use_ambiguous.setChecked("ambiguous" in states)
+        groups = set(settings.get("included_groups", []))
+        for index in range(self.calcium_analysis_groups.count()):
+            item = self.calcium_analysis_groups.item(index)
+            item.setSelected(not groups or item.text() in groups)
+        self.calcium_point_alpha.setValue(float(settings.get("point_alpha", 0.72)))
+        self.calcium_log_x.setChecked(bool(settings.get("log_x", False)))
+        self.calcium_log_y.setChecked(bool(settings.get("log_y", False)))
+        self.calcium_show_regression.setChecked(
+            bool(settings.get("show_regression", True))
+        )
+
+    def _save_named_calcium_analysis(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        settings = self._calcium_analysis_settings()
+        if not settings["morphology_run_id"]:
+            QMessageBox.information(
+                self,
+                "Calcium analysis incomplete",
+                "Select a saved morphology clustering run first.",
+            )
+            return
+        if not settings["accepted_match_states"]:
+            QMessageBox.information(
+                self,
+                "Calcium analysis incomplete",
+                "Select at least one accepted match-confidence state.",
+            )
+            return
+        try:
+            record = upsert_calcium_analysis_run(
+                self._active_calcium_dataset,
+                self.calcium_analysis_name.text(),
+                settings,
+            )
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save calcium analysis", str(exc))
+            return
+        self._prepare_calcium_saved_analyses()
+        index = self.calcium_saved_analysis.findData(record.get("run_id"))
+        if index >= 0:
+            self.calcium_saved_analysis.setCurrentIndex(index)
+        self._render_calcium_analysis()
+
+    def _populate_calcium_metrics(self) -> None:
+        if self._active_calcium_dataset is None:
+            return
+        current = self.calcium_y_metric.currentData()
+        reserved = {
+            "spine_peak_dff",
+            "pearson_r",
+            "recording_id",
+            "spine_roi",
+        }
+        numeric = sorted(
+            {
+                str(key)
+                for recording in self._active_calcium_dataset.get("recordings", [])
+                for spine in recording.get("spines", [])
+                for key in spine.get("metrics", {})
+                if str(key) not in reserved
+            }
+        )
+        self.calcium_y_metric.blockSignals(True)
+        self.calcium_y_metric.clear()
+        self.calcium_y_metric.addItem(
+            "Spine peak ΔF/F0", "calcium_spine_peak_dff"
+        )
+        self.calcium_y_metric.addItem(
+            "Spine-parent Pearson r", "calcium_pearson_r"
+        )
+        for key in numeric:
+            self.calcium_y_metric.addItem(
+                key.replace("_", " ").strip().title(), f"calcium_metric_{key}"
+            )
+        if current is not None:
+            found = self.calcium_y_metric.findData(current)
+            if found >= 0:
+                self.calcium_y_metric.setCurrentIndex(found)
+        self.calcium_y_metric.blockSignals(False)
+
+    def _import_calcium_results(self) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        dialog = CalciumFolderImportDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        folders = dialog.folders()
+        if not folders:
+            QMessageBox.information(
+                self,
+                "No calcium folders selected",
+                "Add at least one calcium-imaging results folder to import.",
+            )
+            return
+        worker = CalciumImportWorker(self.manifest, self.project_path, folders)
+        worker.completed.connect(self._calcium_import_completed)
+        self._start_worker(worker, "calcium_import")
+
+    @Slot(object)
+    def _calcium_import_completed(self, payload: dict[str, object]) -> None:
+        datasets = list(payload.get("datasets", []))
+        if not datasets:
+            return
+        dataset = datasets[-1]
+        self._active_calcium_dataset = dataset
+        self._calcium_scene_cache.clear()
+        self._prepare_morphology_tab()
+        index = self.calcium_dataset.findData(dataset.get("dataset_id"))
+        if index >= 0:
+            self.calcium_dataset.setCurrentIndex(index)
+        QMessageBox.information(
+            self,
+            "Calcium results imported",
+            f"Imported {len(datasets)} calcium experiment(s) containing "
+            f"{sum(len(item.get('recordings', [])) for item in datasets)} specimen(s). "
+            "The source folder was read only; portable copies of registration "
+            "images and parsed ROI coordinates were saved in the Synpo cache."
+            + (
+                "\n\nSome folders were not imported:\n"
+                + "\n".join(str(error) for error in payload.get("errors", []))
+                if payload.get("errors")
+                else ""
+            ),
+        )
+
+    def _relink_calcium_results(self) -> None:
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self._selected_calcium_dataset_id() is None
+        ):
+            return
+        selected = QFileDialog.getExistingDirectory(
+            self, "Relink calcium-imaging results folder", ""
+        )
+        if not selected:
+            return
+        try:
+            self._active_calcium_dataset = relink_calcium_source(
+                self.manifest,
+                self.project_path,
+                self._selected_calcium_dataset_id(),
+                selected,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot relink calcium results", str(exc))
+            return
+        self._calcium_dataset_changed()
+        self.statusBar().showMessage("Calcium results folder relinked.", 8000)
+
+    def _link_calcium_views(
+        self, target: CalciumRegistrationView, zoom: float, x: float, y: float
+    ) -> None:
+        if self._calcium_linking_views:
+            return
+        self._calcium_linking_views = True
+        try:
+            target.set_linked_view(zoom, x, y)
+        finally:
+            self._calcium_linking_views = False
+
+    def _current_calcium_registration(self) -> dict[str, object] | None:
+        if self._active_calcium_dataset is None:
+            return None
+        recording_id = str(self.calcium_recording.currentData() or "")
+        specimen_value = self.calcium_synpo_specimen.currentData()
+        if not recording_id or specimen_value is None:
+            return None
+        return next(
+            (
+                row
+                for row in self._active_calcium_dataset.get("registrations", [])
+                if str(row.get("recording_id")) == recording_id
+                and int(row.get("synpo_specimen_index", -1))
+                == int(specimen_value)
+            ),
+            None,
+        )
+
+    def _calcium_registration_pair_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        if self.manifest is None or self._active_calcium_dataset is None:
+            return
+        recording = self._calcium_recording_value()
+        specimen_value = self.calcium_synpo_specimen.currentData()
+        if recording is None or specimen_value is None:
+            return
+        try:
+            image_path = calcium_reference_image_path(
+                self.manifest,
+                self._active_calcium_dataset,
+                str(recording["recording_id"]),
+            )
+            self.calcium_registration_view.set_calcium_scene(image_path, recording)
+        except (OSError, ValueError) as exc:
+            self.calcium_registration_summary.setText(str(exc))
+            return
+        registration = self._current_calcium_registration()
+        self._calcium_landmarks_source = [
+            tuple(float(value) for value in point)
+            for point in (registration or {}).get("calcium_points_xy", [])
+        ]
+        self._calcium_landmarks_target = [
+            tuple(float(value) for value in point)
+            for point in (registration or {}).get("synpo_points_xy", [])
+        ]
+        if registration is not None:
+            model_index = self.calcium_transform_model.findData(
+                registration.get("model")
+            )
+            if model_index >= 0:
+                self.calcium_transform_model.setCurrentIndex(model_index)
+            self.calcium_registration_summary.setText(
+                f"Saved {registration.get('model')} registration with "
+                f"{registration.get('landmark_count')} landmarks; RMS residual "
+                f"{float(registration.get('rms_error_px', 0.0)):.2f} Synpo px."
+            )
+        else:
+            self.calcium_registration_summary.setText(
+                "No registration is saved for this calcium specimen / Synpo field pair."
+            )
+        self._refresh_calcium_landmarks()
+        specimen_index = int(specimen_value)
+        if specimen_index in self._calcium_scene_cache:
+            self.calcium_synpo_view.set_synpo_scene(
+                self._calcium_scene_cache[specimen_index]
+            )
+        elif self._job_thread is None:
+            worker = CalciumSceneWorker(self.manifest, specimen_index)
+            worker.completed.connect(self._calcium_scene_completed)
+            self._start_worker(worker, "calcium_scene")
+
+    @Slot(object)
+    def _calcium_scene_completed(self, payload: dict[str, object]) -> None:
+        specimen_index = int(payload["specimen_index"])
+        scene = dict(payload["scene"])
+        self._calcium_scene_cache[specimen_index] = scene
+        if self.calcium_synpo_specimen.currentData() == specimen_index:
+            self.calcium_synpo_view.set_synpo_scene(scene)
+            self.calcium_synpo_view.set_landmarks(
+                self._calcium_landmarks_target
+            )
+        if self._pending_calcium_match_uid is not None:
+            QTimer.singleShot(0, self._render_calcium_match_review)
+
+    def _calcium_landmark_clicked(self, x: float, y: float) -> None:
+        if len(self._calcium_landmarks_source) != len(
+            self._calcium_landmarks_target
+        ):
+            self.calcium_registration_summary.setText(
+                "Choose the matching point in the Synpo image before adding another calcium landmark."
+            )
+            return
+        self._calcium_landmarks_source.append((float(x), float(y)))
+        self._refresh_calcium_landmarks()
+        self.calcium_registration_summary.setText(
+            "Calcium landmark added; click the corresponding Synpo point."
+        )
+
+    def _synpo_landmark_clicked(self, x: float, y: float) -> None:
+        if len(self._calcium_landmarks_source) != len(
+            self._calcium_landmarks_target
+        ) + 1:
+            self.calcium_registration_summary.setText(
+                "Choose a point in the calcium image first."
+            )
+            return
+        self._calcium_landmarks_target.append((float(x), float(y)))
+        self._refresh_calcium_landmarks()
+        self.calcium_registration_summary.setText(
+            f"Landmark pair {len(self._calcium_landmarks_target)} added."
+        )
+
+    def _refresh_calcium_landmarks(self) -> None:
+        paired = min(
+            len(self._calcium_landmarks_source),
+            len(self._calcium_landmarks_target),
+        )
+        pending = len(self._calcium_landmarks_source) > paired
+        self.calcium_landmark_table.setRowCount(paired + (1 if pending else 0))
+        for index in range(paired):
+            source = self._calcium_landmarks_source[index]
+            target = self._calcium_landmarks_target[index]
+            for column, value in enumerate(
+                (str(index + 1), f"{source[0]:.1f}", f"{source[1]:.1f}", f"{target[0]:.1f}", f"{target[1]:.1f}")
+            ):
+                self.calcium_landmark_table.setItem(
+                    index, column, QTableWidgetItem(value)
+                )
+        if pending:
+            source = self._calcium_landmarks_source[-1]
+            row = paired
+            for column, value in enumerate(
+                (str(row + 1), f"{source[0]:.1f}", f"{source[1]:.1f}", "pending", "pending")
+            ):
+                self.calcium_landmark_table.setItem(
+                    row, column, QTableWidgetItem(value)
+                )
+        self.calcium_registration_view.set_landmarks(
+            self._calcium_landmarks_source
+        )
+        self.calcium_synpo_view.set_landmarks(self._calcium_landmarks_target)
+
+    def _undo_calcium_landmark(self) -> None:
+        if len(self._calcium_landmarks_source) > len(
+            self._calcium_landmarks_target
+        ):
+            self._calcium_landmarks_source.pop()
+        elif self._calcium_landmarks_target:
+            self._calcium_landmarks_target.pop()
+            self._calcium_landmarks_source.pop()
+        self._refresh_calcium_landmarks()
+
+    def _clear_calcium_landmarks(self) -> None:
+        self._calcium_landmarks_source.clear()
+        self._calcium_landmarks_target.clear()
+        self._refresh_calcium_landmarks()
+
+    def _save_calcium_registration(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+            or self.calcium_synpo_specimen.currentData() is None
+        ):
+            return
+        try:
+            specimen_index = int(self.calcium_synpo_specimen.currentData())
+            scene = self._calcium_scene_cache.get(specimen_index)
+            synpo_shape_yx = (
+                tuple(np.asarray(scene["spine_projection"]).shape[-2:])
+                if scene is not None
+                else None
+            )
+            registration = upsert_registration(
+                self._active_calcium_dataset,
+                str(self.calcium_recording.currentData()),
+                specimen_index,
+                str(self.calcium_transform_model.currentData()),
+                self._calcium_landmarks_source,
+                self._calcium_landmarks_target,
+                synpo_shape_yx,
+            )
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save registration", str(exc))
+            return
+        self.calcium_registration_summary.setText(
+            f"Saved {registration['model']} registration with "
+            f"{registration['landmark_count']} landmark pairs; RMS residual "
+            f"{float(registration['rms_error_px']):.2f} Synpo px."
+        )
+        self._prepare_calcium_tab()
+
+    def _remove_calcium_registration(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+            or self.calcium_synpo_specimen.currentData() is None
+        ):
+            return
+        changed = remove_registration(
+            self._active_calcium_dataset,
+            str(self.calcium_recording.currentData()),
+            int(self.calcium_synpo_specimen.currentData()),
+        )
+        if changed:
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+        self._calcium_landmarks_source.clear()
+        self._calcium_landmarks_target.clear()
+        self._refresh_calcium_landmarks()
+        self.calcium_registration_summary.setText(
+            "No registration is saved for this field pair."
+        )
+
+    def _run_calcium_automatch(self) -> None:
+        if (
+            self.manifest is None
+            or self.project_path is None
+            or self._active_calcium_dataset is None
+        ):
+            return
+        if not self._active_calcium_dataset.get("registrations"):
+            QMessageBox.information(
+                self,
+                "No registered fields",
+                "Save at least one calcium-to-Synpo field registration first.",
+            )
+            return
+        worker = CalciumAutoMatchWorker(
+            self.manifest,
+            self.project_path,
+            self._active_calcium_dataset,
+            self.calcium_match_distance.value(),
+        )
+        worker.completed.connect(self._calcium_automatch_completed)
+        self._start_worker(worker, "calcium_match")
+
+    @Slot(object)
+    def _calcium_automatch_completed(self, payload: dict[str, object]) -> None:
+        self._active_calcium_dataset = dict(payload["dataset"])
+        counts = dict(payload["counts"])
+        self._prepare_calcium_tab()
+        self.calcium_pages.setCurrentIndex(1)
+        self.calcium_match_status.setText(
+            f"Generated {counts.get('proposed', 0)} one-to-one proposals; preserved "
+            f"{counts.get('preserved_reviewed', 0)} reviewed decisions; "
+            f"{counts.get('unmatched', 0)} calcium ROIs remain unmatched; "
+            f"{counts.get('outside_synpo_fields', 0)} outside all registered Synpo "
+            "fields were omitted automatically."
+        )
+
+    def _matches_by_uid(self) -> dict[str, dict[str, object]]:
+        return {
+            str(row.get("calcium_uid")): row
+            for row in (self._active_calcium_dataset or {}).get("matches", [])
+        }
+
+    def _refresh_calcium_match_table(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        previous_uid = self._selected_calcium_uid()
+        self.calcium_match_table.blockSignals(True)
+        self.calcium_match_table.setRowCount(0)
+        if self._active_calcium_dataset is None:
+            self.calcium_match_table.blockSignals(False)
+            self._calcium_match_selection_changed()
+            return
+        coverage = (
+            update_calcium_field_coverage_from_manifest(
+                self.manifest, self._active_calcium_dataset
+            )
+            if self.manifest is not None
+            else update_calcium_field_coverage(self._active_calcium_dataset)
+        )
+        matches = self._matches_by_uid()
+        selected_filter = str(self.calcium_match_filter.currentData() or "all")
+        rows: list[tuple[dict[str, object], dict[str, object] | None, str]] = []
+        for recording in self._active_calcium_dataset.get("recordings", []):
+            for spine in recording.get("spines", []):
+                if not calcium_spine_in_review_scope(spine):
+                    continue
+                match = matches.get(str(spine["calcium_uid"]))
+                state = str(match.get("review_state", "unreviewed")) if match else "unmatched"
+                if selected_filter != "all" and state != selected_filter:
+                    continue
+                rows.append((spine, match, state))
+        self.calcium_match_table.setRowCount(len(rows))
+        for row_index, (spine, match, state) in enumerate(rows):
+            specimen: dict[str, object] = {}
+            if (
+                match is not None
+                and match.get("synpo_specimen_index") is not None
+                and self.manifest is not None
+            ):
+                specimen_index = int(match["synpo_specimen_index"])
+                if 0 <= specimen_index < len(self.manifest["specimens"]):
+                    specimen = self.manifest["specimens"][specimen_index]
+            displayed_state = (
+                "unreviewed (Synpo result changed)"
+                if match is not None
+                and bool(match.get("synpo_result_stale", False))
+                else state
+            )
+            values = (
+                displayed_state,
+                spine.get("recording_id", ""),
+                spine.get("spine_roi", ""),
+                spine.get("parent_segment", ""),
+                "" if spine.get("calcium_spine_peak_dff") is None else f"{float(spine['calcium_spine_peak_dff']):.5g}",
+                "" if spine.get("calcium_pearson_r") is None else f"{float(spine['calcium_pearson_r']):.5g}",
+                specimen.get("experimental_group", ""),
+                specimen.get("specimen_id", ""),
+                "" if match is None or match.get("synpo_dendrite_id") is None else str(match["synpo_dendrite_id"]),
+                "" if match is None or match.get("synpo_spine_id") is None else str(match["synpo_spine_id"]),
+                "" if match is None or match.get("distance_px") is None else f"{float(match['distance_px']):.2f}",
+                "" if match is None else match.get("automatic_confidence", ""),
+                "" if match is None else match.get("note", ""),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, spine["calcium_uid"])
+                self.calcium_match_table.setItem(row_index, column, item)
+        selected_row = -1
+        if previous_uid is not None:
+            for row_index in range(self.calcium_match_table.rowCount()):
+                item = self.calcium_match_table.item(row_index, 0)
+                if (
+                    item is not None
+                    and str(item.data(Qt.ItemDataRole.UserRole)) == previous_uid
+                ):
+                    selected_row = row_index
+                    break
+        if selected_row < 0 and self.calcium_match_table.rowCount():
+            selected_row = 0
+        if selected_row >= 0:
+            self.calcium_match_table.selectRow(selected_row)
+        self.calcium_match_table.blockSignals(False)
+        decided = sum(state != "unreviewed" and state != "unmatched" for _, _, state in rows)
+        stale = sum(
+            bool((match or {}).get("synpo_result_stale", False))
+            for _, match, _state in rows
+        )
+        self.calcium_match_status.setText(
+            f"Showing {len(rows)} calcium ROIs; {decided} have a saved review/ignore "
+            f"decision; {stale} need renewed review after Synpo reprocessing; "
+            f"{coverage.get('outside', 0)} outside all registered Synpo fields are "
+            "omitted automatically."
+        )
+        self._refresh_calcium_dependent_run_labels()
+        self._calcium_match_selection_changed()
+
+    def _refresh_calcium_dependent_run_labels(self) -> None:
+        if self.manifest is None:
+            return
+        records = {
+            str(record.get("run_id")): record
+            for record in self.manifest.get("morphology_analysis", {}).get(
+                "runs", []
+            )
+        }
+        for combo, advanced in (
+            (self.morphology_saved_run, False),
+            (self.advanced_saved_run, True),
+        ):
+            for index in range(combo.count()):
+                record = records.get(str(combo.itemData(index)))
+                if record is None:
+                    continue
+                name = str(record.get("name", "Analysis"))
+                if advanced:
+                    method = str(
+                        record.get("settings", {}).get("reduction_method", "umap")
+                    )
+                    label = "PCC/PCUMAP" if method == "pcumap" else "UMAP"
+                    name = f"{name} [{label}]"
+                if record.get("stale"):
+                    name += " [stale - refit needed]"
+                combo.setItemText(index, name)
+
+    def _selected_calcium_uid(self) -> str | None:
+        row = self.calcium_match_table.currentRow()
+        if row < 0:
+            return None
+        item = self.calcium_match_table.item(row, 0)
+        value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        return str(value) if value else None
+
+    def _calcium_match_selection_changed(self) -> None:
+        uid = self._selected_calcium_uid()
+        match = self._matches_by_uid().get(uid or "")
+        self.calcium_match_note.setText(
+            "" if match is None else str(match.get("note", ""))
+        )
+        context = self._calcium_spine_context(uid) if uid is not None else None
+        if context is not None:
+            recording, _spine = context
+            recording_id = str(recording.get("recording_id", ""))
+            current_specimen = self.calcium_manual_specimen.currentData()
+            registered_specimens = [
+                int(row.get("synpo_specimen_index", -1))
+                for row in (self._active_calcium_dataset or {}).get(
+                    "registrations", []
+                )
+                if str(row.get("recording_id", "")) == recording_id
+            ]
+            desired_specimen = (
+                int(match["synpo_specimen_index"])
+                if match is not None
+                and match.get("synpo_specimen_index") is not None
+                else (
+                    int(current_specimen)
+                    if current_specimen is not None
+                    and int(current_specimen) in registered_specimens
+                    else (
+                        registered_specimens[0]
+                        if registered_specimens
+                        else current_specimen
+                    )
+                )
+            )
+            if desired_specimen is not None:
+                combo_index = self.calcium_manual_specimen.findData(
+                    int(desired_specimen)
+                )
+                if combo_index >= 0:
+                    self.calcium_manual_specimen.blockSignals(True)
+                    self.calcium_manual_specimen.setCurrentIndex(combo_index)
+                    self.calcium_manual_specimen.blockSignals(False)
+            if match is not None and match.get("synpo_spine_id") is not None:
+                self.calcium_manual_spine.setValue(int(match["synpo_spine_id"]))
+        self._render_calcium_match_review()
+
+    def _calcium_manual_specimen_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        self._render_calcium_match_review()
+
+    def _calcium_synpo_spine_clicked(self, spine_id: int) -> None:
+        if spine_id <= 0:
+            self.calcium_match_visual_status.setText(
+                "No Synpo spine was found at that point. Click inside a colored spine "
+                "outline, zoom in, or turn on Pan to move the image."
+            )
+            return
+        if self.calcium_manual_specimen.currentData() is None:
+            self.calcium_match_visual_status.setText(
+                "Choose a Synpo specimen before clicking a spine."
+            )
+            return
+        self.calcium_manual_spine.setValue(int(spine_id))
+        self._assign_manual_calcium_match(clicked=True)
+
+    def _calcium_spine_context(
+        self, calcium_uid: str
+    ) -> tuple[dict[str, object], dict[str, object]] | None:
+        if self._active_calcium_dataset is None:
+            return None
+        for recording in self._active_calcium_dataset.get("recordings", []):
+            for spine in recording.get("spines", []):
+                if str(spine.get("calcium_uid")) == str(calcium_uid):
+                    return recording, spine
+        return None
+
+    def _registration_for_calcium_match(
+        self,
+        match: dict[str, object],
+        recording_id: str,
+    ) -> dict[str, object] | None:
+        if self._active_calcium_dataset is None:
+            return None
+        registrations = self._active_calcium_dataset.get("registrations", [])
+        registration_id = str(match.get("registration_id") or "")
+        if registration_id:
+            exact = next(
+                (
+                    row
+                    for row in registrations
+                    if str(row.get("registration_id")) == registration_id
+                ),
+                None,
+            )
+            if exact is not None:
+                return exact
+        specimen_value = match.get("synpo_specimen_index")
+        if specimen_value is None:
+            return None
+        return next(
+            (
+                row
+                for row in registrations
+                if str(row.get("recording_id")) == recording_id
+                and int(row.get("synpo_specimen_index", -1))
+                == int(specimen_value)
+            ),
+            None,
+        )
+
+    def _registration_for_calcium_field(
+        self,
+        recording_id: str,
+        specimen_index: int,
+        preferred_registration_id: str = "",
+    ) -> dict[str, object] | None:
+        registrations = (self._active_calcium_dataset or {}).get(
+            "registrations", []
+        )
+        if preferred_registration_id:
+            exact = next(
+                (
+                    row
+                    for row in registrations
+                    if str(row.get("registration_id", ""))
+                    == preferred_registration_id
+                    and str(row.get("recording_id", "")) == recording_id
+                    and int(row.get("synpo_specimen_index", -1))
+                    == int(specimen_index)
+                ),
+                None,
+            )
+            if exact is not None:
+                return exact
+        return next(
+            (
+                row
+                for row in registrations
+                if str(row.get("recording_id", "")) == recording_id
+                and int(row.get("synpo_specimen_index", -1))
+                == int(specimen_index)
+            ),
+            None,
+        )
+
+    def _render_calcium_match_review_legacy(self) -> None:
+        uid = self._selected_calcium_uid()
+        if (
+            uid is None
+            or self.manifest is None
+            or self._active_calcium_dataset is None
+        ):
+            self._pending_calcium_match_uid = None
+            self.calcium_match_calcium_view.show_placeholder(
+                "Select a calcium ROI in the table"
+            )
+            self.calcium_match_synpo_view.show_placeholder(
+                "A matched ROI and saved registration are needed"
+            )
+            self.calcium_match_visual_status.setText(
+                "Select a calcium ROI to inspect its proposed alignment."
+            )
+            return
+        context = self._calcium_spine_context(uid)
+        if context is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_calcium_view.show_placeholder(
+                "The selected calcium ROI is unavailable"
+            )
+            self.calcium_match_synpo_view.show_placeholder(
+                "The selected calcium ROI is unavailable"
+            )
+            self.calcium_match_visual_status.setText(
+                "The selected table row no longer exists in this calcium dataset."
+            )
+            return
+        recording, spine = context
+        recording_id = str(recording.get("recording_id", ""))
+        try:
+            image_path = calcium_reference_image_path(
+                self.manifest,
+                self._active_calcium_dataset,
+                recording_id,
+            )
+            self.calcium_match_calcium_view.set_calcium_match_scene(
+                image_path, recording, spine
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self.calcium_match_calcium_view.show_placeholder(
+                "Calcium reference image unavailable"
+            )
+            self.calcium_match_synpo_view.show_placeholder(
+                "Cannot display an alignment without the calcium reference image"
+            )
+            self.calcium_match_visual_status.setText(str(exc))
+            return
+
+        match = self._matches_by_uid().get(uid)
+        if match is None or match.get("synpo_spine_id") is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "This calcium ROI has no proposed Synpo match"
+            )
+            state = "unmatched" if match is None else str(
+                match.get("review_state", "unmatched")
+            )
+            self.calcium_match_visual_status.setText(
+                f"Calcium ROI {spine.get('spine_roi', '')} is {state}; its source ROI "
+                "is shown on the left, but there is no Synpo target to overlay."
+            )
+            return
+        specimen_value = match.get("synpo_specimen_index")
+        if specimen_value is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "The proposed match has no Synpo specimen"
+            )
+            self.calcium_match_visual_status.setText(
+                "This proposed match is incomplete: no Synpo specimen is assigned."
+            )
+            return
+        specimen_index = int(specimen_value)
+        if not 0 <= specimen_index < len(self.manifest.get("specimens", [])):
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "The saved Synpo specimen is unavailable"
+            )
+            self.calcium_match_visual_status.setText(
+                f"The match refers to unavailable Synpo specimen index {specimen_index}."
+            )
+            return
+        registration = self._registration_for_calcium_match(match, recording_id)
+        if registration is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "No saved registration for this calcium/Synpo field pair"
+            )
+            self.calcium_match_visual_status.setText(
+                "The proposed match exists, but its calcium-to-Synpo registration is "
+                "missing. Re-register this field before reviewing the overlay."
+            )
+            return
+        scene = self._calcium_scene_cache.get(specimen_index)
+        if scene is None:
+            self._pending_calcium_match_uid = uid
+            self.calcium_match_synpo_view.show_placeholder(
+                "Preparing the matched Synpo projection…"
+            )
+            self.calcium_match_visual_status.setText(
+                "Preparing the aligned Synpo projection and ROI overlay."
+            )
+            if self._job_thread is None:
+                worker = CalciumSceneWorker(self.manifest, specimen_index)
+                worker.completed.connect(self._calcium_scene_completed)
+                self._start_worker(worker, "calcium_match_scene")
+            return
+        try:
+            overlay = self.calcium_match_synpo_view.set_synpo_match_scene(
+                scene, registration, recording, spine, match
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "Cannot draw this saved registration"
+            )
+            self.calcium_match_visual_status.setText(
+                f"Cannot draw the match overlay: {exc}"
+            )
+            return
+        self._pending_calcium_match_uid = None
+        specimen = self.manifest["specimens"][specimen_index]
+        measured_distance = overlay.get("measured_distance_px")
+        distance_text = (
+            "unknown"
+            if measured_distance is None
+            else f"{float(measured_distance):.2f} px"
+        )
+        outside_warning = (
+            " Warning: the transformed calcium ROI falls outside the Synpo image; "
+            "check or redo this field registration."
+            if not bool(overlay.get("transformed_roi_in_frame", False))
+            else ""
+        )
+        self.calcium_match_visual_status.setText(
+            f"{str(match.get('review_state', 'unreviewed')).title()} match: calcium "
+            f"{recording_id} / {spine.get('spine_roi', '')} → "
+            f"{specimen.get('experimental_group', '')} / "
+            f"{specimen.get('specimen_id', '')} / spine "
+            f"{int(match.get('synpo_spine_id') or 0)}. Overlay center distance "
+            f"{distance_text}; {str(registration.get('model', 'affine'))} registration "
+            f"RMS {float(registration.get('rms_error_px', 0.0)):.2f} px. The dashed "
+            "white line connects the transformed calcium center to the matched Synpo center."
+            + outside_warning
+        )
+
+    def _render_calcium_match_review(self) -> None:
+        uid = self._selected_calcium_uid()
+        if (
+            uid is None
+            or self.manifest is None
+            or self._active_calcium_dataset is None
+        ):
+            self._pending_calcium_match_uid = None
+            self.calcium_match_calcium_view.show_placeholder(
+                "Select a calcium ROI in the table"
+            )
+            self.calcium_match_synpo_view.show_placeholder(
+                "Choose a Synpo specimen, then click a spine to assign it"
+            )
+            self.calcium_match_visual_status.setText(
+                "Select a calcium ROI to inspect or create its Synpo match."
+            )
+            return
+        context = self._calcium_spine_context(uid)
+        if context is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_calcium_view.show_placeholder(
+                "The selected calcium ROI is unavailable"
+            )
+            self.calcium_match_synpo_view.show_placeholder(
+                "The selected calcium ROI is unavailable"
+            )
+            self.calcium_match_visual_status.setText(
+                "The selected table row no longer exists in this calcium dataset."
+            )
+            return
+        recording, spine = context
+        recording_id = str(recording.get("recording_id", ""))
+        try:
+            image_path = calcium_reference_image_path(
+                self.manifest,
+                self._active_calcium_dataset,
+                recording_id,
+            )
+            self.calcium_match_calcium_view.set_calcium_match_scene(
+                image_path, recording, spine
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self.calcium_match_calcium_view.show_placeholder(
+                "Calcium reference image unavailable"
+            )
+            self.calcium_match_visual_status.setText(str(exc))
+
+        specimen_value = self.calcium_manual_specimen.currentData()
+        if specimen_value is None:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "Choose a Synpo specimen to browse"
+            )
+            self.calcium_match_visual_status.setText(
+                "Choose a Synpo specimen below, then click a spine in the right image."
+            )
+            return
+        specimen_index = int(specimen_value)
+        specimens = self.manifest.get("specimens", [])
+        if not 0 <= specimen_index < len(specimens):
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "The selected Synpo specimen is unavailable"
+            )
+            self.calcium_match_visual_status.setText(
+                f"Synpo specimen index {specimen_index} is unavailable."
+            )
+            return
+        match = self._matches_by_uid().get(uid)
+        match_in_view = bool(
+            match is not None
+            and match.get("synpo_specimen_index") is not None
+            and int(match["synpo_specimen_index"]) == specimen_index
+            and match.get("synpo_spine_id") is not None
+        )
+        preferred_registration_id = (
+            str(match.get("registration_id") or "")
+            if match_in_view and match is not None
+            else ""
+        )
+        registration = self._registration_for_calcium_field(
+            recording_id,
+            specimen_index,
+            preferred_registration_id,
+        )
+        scene = self._calcium_scene_cache.get(specimen_index)
+        if scene is None:
+            self._pending_calcium_match_uid = uid
+            self.calcium_match_synpo_view.show_placeholder(
+                "Preparing the selected Synpo projection..."
+            )
+            self.calcium_match_visual_status.setText(
+                "Preparing the Synpo field for click-to-match review."
+            )
+            if self._job_thread is None:
+                worker = CalciumSceneWorker(self.manifest, specimen_index)
+                worker.completed.connect(self._calcium_scene_completed)
+                self._start_worker(worker, "calcium_match_scene")
+            return
+        try:
+            if registration is not None:
+                overlay = self.calcium_match_synpo_view.set_synpo_match_scene(
+                    scene,
+                    registration,
+                    recording,
+                    spine,
+                    match if match_in_view and match is not None else {},
+                )
+            else:
+                overlay = None
+                self.calcium_match_synpo_view.set_synpo_browse_scene(
+                    scene,
+                    int(match["synpo_spine_id"])
+                    if match_in_view and match is not None
+                    else None,
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            self._pending_calcium_match_uid = None
+            self.calcium_match_synpo_view.show_placeholder(
+                "Cannot draw the selected Synpo field"
+            )
+            self.calcium_match_visual_status.setText(
+                f"Cannot draw the match view: {exc}"
+            )
+            return
+        self._pending_calcium_match_uid = None
+        specimen = specimens[specimen_index]
+        field_name = (
+            f"{specimen.get('experimental_group', '')} / "
+            f"{specimen.get('specimen_id', '')}"
+        )
+        click_instruction = (
+            "Click any Synpo spine to assign it immediately. Turn on Pan before "
+            "left-dragging the image."
+        )
+        if match_in_view and match is not None and registration is not None:
+            measured_distance = overlay.get("measured_distance_px") if overlay else None
+            distance_text = (
+                "unknown"
+                if measured_distance is None
+                else f"{float(measured_distance):.2f} px"
+            )
+            outside_warning = (
+                " Warning: the transformed calcium ROI falls outside this Synpo image."
+                if overlay is not None
+                and not bool(overlay.get("transformed_roi_in_frame", False))
+                else ""
+            )
+            self.calcium_match_visual_status.setText(
+                f"{str(match.get('review_state', 'unreviewed')).title()} match in "
+                f"{field_name}: Synpo spine {int(match.get('synpo_spine_id') or 0)}; "
+                f"center distance {distance_text}; "
+                f"{str(registration.get('model', 'affine'))} registration RMS "
+                f"{float(registration.get('rms_error_px', 0.0)):.2f} px. "
+                f"{click_instruction}{outside_warning}"
+            )
+            return
+        if registration is not None:
+            saved_elsewhere = (
+                " A saved match exists in another Synpo specimen."
+                if match is not None and match.get("synpo_spine_id") is not None
+                else ""
+            )
+            self.calcium_match_visual_status.setText(
+                f"Browsing registered Synpo field {field_name}. The transformed "
+                f"calcium ROI is yellow and its parent segment is cyan. "
+                f"{click_instruction}{saved_elsewhere}"
+            )
+            return
+        match_text = (
+            f" The saved Synpo spine {int(match.get('synpo_spine_id') or 0)} is "
+            "highlighted, but its calcium ROI cannot be overlaid."
+            if match_in_view and match is not None
+            else ""
+        )
+        self.calcium_match_visual_status.setText(
+            f"Browsing Synpo field {field_name} without a saved calcium registration. "
+            f"You can still assign by clicking a spine.{match_text} {click_instruction}"
+        )
+
+    def _review_selected_calcium_match(self, state: str) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        uid = self._selected_calcium_uid()
+        if uid is None:
+            return
+        next_row = min(
+            self.calcium_match_table.rowCount() - 1,
+            self.calcium_match_table.currentRow() + 1,
+        )
+        try:
+            set_match_review(
+                self._active_calcium_dataset,
+                uid,
+                state,
+                self.calcium_match_note.text().strip(),
+            )
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot review calcium match", str(exc))
+            return
+        self._refresh_calcium_match_table()
+        if self.calcium_match_table.rowCount():
+            self.calcium_match_table.selectRow(max(0, next_row))
+
+    def _clear_selected_calcium_match(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        uid = self._selected_calcium_uid()
+        if uid is None:
+            return
+        self._active_calcium_dataset["matches"] = [
+            row
+            for row in self._active_calcium_dataset.get("matches", [])
+            if str(row.get("calcium_uid")) != uid
+        ]
+        save_calcium_dataset(
+            self.manifest, self.project_path, self._active_calcium_dataset
+        )
+        self._refresh_calcium_match_table()
+
+    def _confirm_all_calcium_matches(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        count = review_all_proposed(self._active_calcium_dataset, "confirmed")
+        save_calcium_dataset(
+            self.manifest, self.project_path, self._active_calcium_dataset
+        )
+        self._refresh_calcium_match_table()
+        self.calcium_match_status.setText(
+            f"Confirmed {count} previously unreviewed automatic proposals."
+        )
+
+    def _ignore_all_unmatched_calcium(self) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+        ):
+            return
+        count = ignore_all_unmatched(self._active_calcium_dataset)
+        save_calcium_dataset(
+            self.manifest, self.project_path, self._active_calcium_dataset
+        )
+        self._refresh_calcium_match_table()
+        self.calcium_match_status.setText(
+            f"Marked {count} previously unmatched calcium ROIs as ignored."
+        )
+
+    def _assign_manual_calcium_match(self, *, clicked: bool = False) -> None:
+        if (
+            self._active_calcium_dataset is None
+            or self.manifest is None
+            or self.project_path is None
+            or self.calcium_manual_specimen.currentData() is None
+        ):
+            return
+        uid = self._selected_calcium_uid()
+        if uid is None:
+            return
+        specimen_index = int(self.calcium_manual_specimen.currentData())
+        spine_id = self.calcium_manual_spine.value()
+        try:
+            scene = self._calcium_scene_cache.get(specimen_index)
+            row = next(
+                (
+                    value
+                    for value in (scene or {}).get("spines", [])
+                    if int(value.get("spine_id", 0)) == spine_id
+                ),
+                None,
+            )
+            if row is None:
+                result, _audit = filtered_measurement_result(
+                    self.manifest, specimen_index
+                )
+                row = next(
+                    (
+                        value
+                        for value in result.get("spine_rows", [])
+                        if int(value.get("spine_id", 0)) == spine_id
+                    ),
+                    None,
+                )
+            if row is None:
+                raise ValueError("That spine ID does not exist in the selected Synpo specimen.")
+            if not bool(row.get("spine_valid", True)) or bool(
+                row.get("volume_filter_excluded", False)
+            ):
+                raise ValueError("That Synpo spine is invalidated or volume-filtered.")
+            assign_manual_match(
+                self._active_calcium_dataset,
+                uid,
+                specimen_index,
+                spine_id,
+                review_state="confirmed",
+                note=self.calcium_match_note.text().strip(),
+                synpo_dendrite_id=int(row.get("dendrite_id") or 0),
+            )
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot assign manual match", str(exc))
+            return
+        self._refresh_calcium_match_table()
+        action = "Clicked" if clicked else "Assigned"
+        self.calcium_match_status.setText(
+            f"{action} Synpo spine {spine_id} in the selected specimen and saved "
+            "the match as confirmed."
+        )
+
+    def _accepted_calcium_match_states(self) -> tuple[str, ...]:
+        values = []
+        if self.calcium_use_confirmed.isChecked():
+            values.append("confirmed")
+        if self.calcium_use_probable.isChecked():
+            values.append("probable")
+        if self.calcium_use_ambiguous.isChecked():
+            values.append("ambiguous")
+        return tuple(values)
+
+    def _prepare_calcium_groups(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        selected = {item.text() for item in self.calcium_analysis_groups.selectedItems()}
+        had_choices = self.calcium_analysis_groups.count() > 0
+        self.calcium_analysis_groups.clear()
+        if self.manifest is None:
+            return
+        groups = sorted(
+            {
+                str(specimen.get("experimental_group", ""))
+                for specimen in self.manifest.get("specimens", [])
+            }
+        )
+        for group in groups:
+            self.calcium_analysis_groups.addItem(group)
+            item = self.calcium_analysis_groups.item(
+                self.calcium_analysis_groups.count() - 1
+            )
+            item.setSelected(group in selected if had_choices else True)
+
+    def _selected_calcium_groups(self) -> tuple[str, ...]:
+        return tuple(
+            item.text() for item in self.calcium_analysis_groups.selectedItems()
+        )
+
+    @staticmethod
+    def _calcium_number(value: object) -> str:
+        if value is None:
+            return "—"
+        number = float(value)
+        return f"{number:.4g}" if np.isfinite(number) else "—"
+
+    def _render_calcium_analysis(self) -> None:
+        if self.manifest is None:
+            return
+        dataset_id = self._selected_calcium_dataset_id()
+        run_id = self.calcium_morphology_run.currentData()
+        states = self._accepted_calcium_match_states()
+        if not dataset_id or not run_id:
+            self.calcium_analysis_status.setText(
+                "Select a calcium dataset and saved morphology clustering run."
+            )
+            return
+        if not states:
+            self.calcium_analysis_status.setText(
+                "Select at least one accepted match-confidence state."
+            )
+            return
+        try:
+            rows, audit, run = calcium_analysis_rows(
+                self.manifest, dataset_id, str(run_id), states
+            )
+            groups = self._selected_calcium_groups()
+            statistics = draw_calcium_dependency(
+                self.calcium_figure,
+                rows,
+                run,
+                x_key=str(self.calcium_x_metric.currentData()),
+                y_key=str(self.calcium_y_metric.currentData()),
+                included_groups=groups,
+                point_alpha=self.calcium_point_alpha.value(),
+                log_x=self.calcium_log_x.isChecked(),
+                log_y=self.calcium_log_y.isChecked(),
+                show_regression=self.calcium_show_regression.isChecked(),
+            )
+        except (OSError, ValueError) as exc:
+            self.calcium_analysis_status.setText(str(exc))
+            self.calcium_figure.clear()
+            self.calcium_plot.draw_idle()
+            return
+        self.calcium_plot.draw_idle()
+        self.calcium_statistics_table.setRowCount(len(statistics))
+        for row_index, summary in enumerate(statistics):
+            interval = (
+                "—"
+                if summary.get("specimen_bootstrap_pearson_ci_low") is None
+                else f"[{float(summary['specimen_bootstrap_pearson_ci_low']):.3f}, "
+                f"{float(summary['specimen_bootstrap_pearson_ci_high']):.3f}]"
+            )
+            values = (
+                summary.get("morphology_cluster_id"),
+                summary.get("spine_count"),
+                summary.get("specimen_count"),
+                self._calcium_number(summary.get("pearson_r")),
+                self._calcium_number(summary.get("pearson_p")),
+                self._calcium_number(summary.get("spearman_rho")),
+                interval,
+                self._calcium_number(summary.get("regression_slope")),
+            )
+            for column, value in enumerate(values):
+                self.calcium_statistics_table.setItem(
+                    row_index, column, QTableWidgetItem(str(value))
+                )
+        included = sum(int(row.get("spine_count", 0)) for row in statistics)
+        group_rows = [
+            row
+            for row in rows
+            if not groups
+            or str(row.get("experimental_group", "")) in set(groups)
+        ]
+        missing_plot_metrics = max(0, len(group_rows) - included)
+        unavailable = sum(
+            row.get("analysis_status") != "included" for row in audit
+        )
+        self.calcium_analysis_status.setText(
+            f"Plotted {included} reviewed matched spines across {len(statistics)} "
+            f"morphology clusters. {unavailable} match/audit rows are not included "
+            f"under the selected confidence and morphology-run filters; "
+            f"{missing_plot_metrics} additional matched rows lack a selected plot metric. "
+            "Puncta-negative "
+            "spines use protein volume 0; missing measurements remain omitted."
+        )
+        if self._active_calcium_dataset is not None and self.project_path is not None:
+            self._active_calcium_dataset[
+                "analysis_settings"
+            ] = self._calcium_analysis_settings()
+            save_calcium_dataset(
+                self.manifest, self.project_path, self._active_calcium_dataset
+            )
+
+    def _export_calcium_analysis(self) -> None:
+        if self.manifest is None:
+            return
+        dataset_id = self._selected_calcium_dataset_id()
+        run_id = self.calcium_morphology_run.currentData()
+        states = self._accepted_calcium_match_states()
+        if not dataset_id or not run_id or not states:
+            QMessageBox.information(
+                self,
+                "Calcium analysis incomplete",
+                "Select a dataset, morphology run, and at least one accepted match state.",
+            )
+            return
+        default = (
+            str(Path(str(self.manifest["output_directory"])) / "Synpo_calcium_matching.xlsx")
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export calcium matching analysis",
+            default,
+            "Excel workbook (*.xlsx)",
+        )
+        if not selected:
+            return
+        worker = CalciumExportWorker(
+            self.manifest,
+            dataset_id,
+            str(run_id),
+            Path(selected),
+            states,
+            str(self.calcium_x_metric.currentData()),
+            str(self.calcium_y_metric.currentData()),
+            self._selected_calcium_groups(),
+            self.calcium_point_alpha.value(),
+            self.calcium_log_x.isChecked(),
+            self.calcium_log_y.isChecked(),
+            self.calcium_show_regression.isChecked(),
+            self.calcium_analysis_name.text().strip(),
+            str(self.calcium_saved_analysis.currentData() or ""),
+        )
+        worker.completed.connect(self._calcium_export_completed)
+        self._start_worker(worker, "calcium_export")
+
+    @Slot(object)
+    def _calcium_export_completed(self, path: Path) -> None:
+        QMessageBox.information(
+            self,
+            "Calcium analysis exported",
+            f"Saved workbook, CSV audit tables, and SVG/PDF/600-DPI PNG figures:\n{path}",
+        )
 
     def _role_combo(self, selected: str) -> QComboBox:
         combo = QComboBox()
@@ -6742,10 +10685,28 @@ class MainWindow(QMainWindow):
         for channel in channels:
             completed_channels.pop(channel, None)
         preprocessing.update({"state": "not_started", "updated_at": now})
+        roles = self.manifest.get("channel_roles", {})
+        clusters_only = bool(channels) and all(
+            roles.get(channel) == "protein_clusters" for channel in channels
+        )
+        if clusters_only:
+            specimen["checkpoints"].setdefault("detection", {})[
+                "cluster_refresh_required"
+            ] = True
+            specimen["checkpoints"].setdefault("measurements", {}).update(
+                {"state": "not_started", "updated_at": now}
+            )
+            for run in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                run["stale"] = True
+            return
         for stage in ("detection", "review", "measurements"):
             checkpoint = specimen["checkpoints"].setdefault(stage, {})
             checkpoint.update({"state": "not_started", "updated_at": now})
         specimen["review"]["state"] = "needs_attention"
+        self._invalidate_calcium_after_synpo_change(
+            specimen_index,
+            reason="Synpo preprocessing parameters or analysis ROIs changed",
+        )
         self._context_cache = {
             key: value
             for key, value in self._context_cache.items()
@@ -6888,17 +10849,28 @@ class MainWindow(QMainWindow):
             return
         try:
             index = self._selected_specimen_index()
+            channel = self._selected_preprocess_channel()
             specimen = self.manifest["specimens"][index]
             has_review_work = bool(specimen.get("review", {}).get("history")) or (
                 specimen.get("checkpoints", {}).get("review", {}).get("state")
                 not in {None, "not_started"}
             )
-            if has_review_work:
+            cluster_channel = next(
+                candidate
+                for candidate, role in self.manifest["channel_roles"].items()
+                if role == "protein_clusters"
+            )
+            cluster_only = (
+                channel == cluster_channel
+                and specimen["checkpoints"].get("detection", {}).get("state")
+                == "complete"
+            )
+            if has_review_work and not cluster_only:
                 answer = QMessageBox.warning(
                     self,
                     "Discard manual corrections?",
-                    "Reprocessing permanently discards all manual corrections and their history "
-                    "for this specimen. Continue?",
+                    "Reprocessing the dendrite/spine channel permanently discards all manual "
+                    "corrections and their history for this specimen. Continue?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
@@ -6917,14 +10889,78 @@ class MainWindow(QMainWindow):
                 )
             if bool(specimen.get("analysis", {}).get("excluded", False)):
                 raise ValueError("This specimen is excluded from analysis.")
+            if has_review_work and not cluster_only:
+                discard_specimen_review(self.manifest, self.project_path, index)
+            if not cluster_only:
+                self._invalidate_calcium_after_synpo_change(
+                    index,
+                    reason="Synpo dendrite/spine preprocessing was rerun for this specimen",
+                )
+            save_project(self.project_path, self.manifest)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Cannot reprocess specimen", str(exc))
+            return
+        self._pending_detection_after_preprocess = index
+        self._pending_cluster_detection_after_preprocess = cluster_only
+        worker = BatchPreprocessWorker(
+            self.manifest, self.project_path, [index], channels=[channel]
+        )
+        worker.completed.connect(self._batch_preprocessing_completed)
+        worker.cancelled.connect(self._batch_preprocessing_cancelled)
+        self._start_worker(worker, "preprocess")
+
+    def _run_selected_specimen_preprocessing(self) -> None:
+        """Reprocess both channels, then force full detection for one specimen."""
+
+        if self.manifest is None or self.project_path is None:
+            return
+        try:
+            index = self._selected_specimen_index()
+            specimen = self.manifest["specimens"][index]
+            has_review_work = bool(specimen.get("review", {}).get("history")) or (
+                specimen.get("checkpoints", {}).get("review", {}).get("state")
+                not in {None, "not_started"}
+            )
+            if has_review_work:
+                answer = QMessageBox.warning(
+                    self,
+                    "Discard manual corrections?",
+                    "Reprocessing both channels permanently discards all manual corrections "
+                    "and their history for this specimen. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            self._store_preprocessing_selection()
+            missing = [
+                candidate
+                for candidate in ("ChanA", "ChanB")
+                if not preprocessing_parameters_set(self.manifest, index, candidate)
+            ]
+            if missing:
+                raise ValueError(
+                    "Set both channel parameters before reprocessing this specimen: "
+                    + ", ".join(missing)
+                )
+            if bool(specimen.get("analysis", {}).get("excluded", False)):
+                raise ValueError("This specimen is excluded from analysis.")
+            self._invalidate_preprocessing_channels(index, ["ChanA", "ChanB"])
             if has_review_work:
                 discard_specimen_review(self.manifest, self.project_path, index)
             save_project(self.project_path, self.manifest)
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot reprocess specimen", str(exc))
             return
+
         self._pending_detection_after_preprocess = index
-        worker = BatchPreprocessWorker(self.manifest, self.project_path, [index])
+        self._pending_cluster_detection_after_preprocess = False
+        worker = BatchPreprocessWorker(
+            self.manifest,
+            self.project_path,
+            [index],
+            channels=["ChanA", "ChanB"],
+        )
         worker.completed.connect(self._batch_preprocessing_completed)
         worker.cancelled.connect(self._batch_preprocessing_cancelled)
         self._start_worker(worker, "preprocess")
@@ -6939,23 +10975,62 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _batch_preprocessing_completed(self, result: dict[str, object]) -> None:
-        self._pending_detection_ready = getattr(
-            self, "_pending_detection_after_preprocess", None
+        pending = self._pending_detection_after_preprocess
+        self._pending_detection_ready = pending
+        self._pending_cluster_detection_ready = (
+            self._pending_cluster_detection_after_preprocess
         )
         elapsed = float(result["elapsed_seconds"])
         self.preprocessing_status.setText(
             f"Batch preprocessing complete in {elapsed / 60:.1f} min. "
             f"Compressed cache: {result['cache_path']}"
+            + (
+                " The refreshed specimen is being passed to automatic detection."
+                if pending is not None
+                else ""
+            )
         )
         self._prepare_preprocessing_tab()
         self._prepare_detection_tab()
         self._prepare_review_tab()
         self._prepare_measurements_tab()
+        self._prepare_morphology_tab()
+        QTimer.singleShot(0, self._continue_selected_preprocessing_pipeline)
+
+    @Slot()
+    def _continue_selected_preprocessing_pipeline(self) -> None:
+        """Start selected detection after preprocessing, independent of signal order."""
+
+        pending = self._pending_detection_ready
+        if pending is None or self._job_thread is not None:
+            return
+        clusters_only = self._pending_cluster_detection_ready
+        self._pending_detection_after_preprocess = None
+        self._pending_detection_ready = None
+        self._pending_cluster_detection_after_preprocess = False
+        self._pending_cluster_detection_ready = False
+        row = self.detection_specimen.findData(int(pending))
+        if row >= 0:
+            self.detection_specimen.setCurrentIndex(row)
+        self.tabs.setCurrentIndex(2)
+        self.detection_status.setText(
+            "Refreshed cluster preprocessing is ready. Updating protein-cluster "
+            "labels while preserving manual dendrite/spine corrections."
+            if clusters_only
+            else "Refreshed preprocessing is ready. Starting detection for the selected "
+            "specimen now; saved calcium landmarks are retained."
+        )
+        if clusters_only:
+            self._run_selected_cluster_detection(int(pending))
+        else:
+            self._run_selected_detection(int(pending), force=True)
 
     @Slot(str)
     def _batch_preprocessing_cancelled(self, message: str) -> None:
         self._pending_detection_after_preprocess = None
         self._pending_detection_ready = None
+        self._pending_cluster_detection_after_preprocess = False
+        self._pending_cluster_detection_ready = False
         self.preprocessing_status.setText(message)
         if self.project_path is not None and self.manifest is not None:
             save_project(self.project_path, self.manifest)
@@ -7136,6 +11211,10 @@ class MainWindow(QMainWindow):
                 self.manifest["detection"].setdefault("settings_by_specimen", {})[
                     str(index)
                 ] = self._current_detection_settings().to_dict()
+            self._invalidate_calcium_after_synpo_change(
+                index,
+                reason="Synpo detection was rerun for this specimen",
+            )
             discard_specimen_review(self.manifest, self.project_path, index)
             save_project(self.project_path, self.manifest)
         except (TypeError, ValueError, OSError) as exc:
@@ -7143,6 +11222,29 @@ class MainWindow(QMainWindow):
             return
         worker = DetectionWorker(
             self.manifest, self.project_path, [index], force=force
+        )
+        worker.pair_completed.connect(self._detection_pair_completed)
+        worker.completed.connect(self._detection_completed)
+        worker.cancelled.connect(self._detection_cancelled)
+        self._pending_review_after_detection = index
+        self._start_worker(worker, "detection")
+
+    def _run_selected_cluster_detection(self, specimen_index: int) -> None:
+        if self.manifest is None or self.project_path is None:
+            return
+        specimen = self.manifest["specimens"][int(specimen_index)]
+        if specimen["checkpoints"]["preprocessing"].get("state") != "complete":
+            QMessageBox.warning(
+                self,
+                "Cannot refresh clusters",
+                "Cluster preprocessing did not complete; the prior cluster labels remain active.",
+            )
+            return
+        worker = DetectionWorker(
+            self.manifest,
+            self.project_path,
+            [int(specimen_index)],
+            clusters_only=True,
         )
         worker.pair_completed.connect(self._detection_pair_completed)
         worker.completed.connect(self._detection_completed)
@@ -7162,6 +11264,7 @@ class MainWindow(QMainWindow):
         self, specimen_index: int, summary: dict[str, object]
     ) -> None:
         outcome = str(summary.get("outcome", "complete"))
+        clusters_only = bool(summary.get("clusters_only", False))
         if outcome != "complete":
             specimen = self.manifest["specimens"][specimen_index]
             self.detection_status.setText(
@@ -7180,6 +11283,11 @@ class MainWindow(QMainWindow):
             return
         if not bool(summary.get("skipped", False)):
             self._invalidate_context_views(specimen_index, corrected_only=False)
+            if not clusters_only:
+                self._invalidate_calcium_after_synpo_change(
+                    specimen_index,
+                    reason="Synpo detection produced new spine labels",
+                )
         self.detection_status.setText(
             f"Completed pair {specimen_index + 1}: {summary['dendrite_count']} dendrite "
             f"field(s), {summary['spine_count']} spine candidates, "
@@ -7189,7 +11297,11 @@ class MainWindow(QMainWindow):
         reused = "reused, " if bool(summary.get("reused", False)) else ""
         self.detection_status.setText(
             f"Completed pair {specimen_index + 1} ({reused}{mode}). "
-            "Detection continues in the background."
+            + (
+                "Protein-cluster labels were refreshed; manual corrections were preserved."
+                if clusters_only
+                else "Detection continues in the background."
+            )
         )
         row = self.detection_specimen.findData(specimen_index)
         if row >= 0:
@@ -7205,18 +11317,45 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _detection_completed(self, result: dict[str, object]) -> None:
-        self.detection_status.setText(
-            f"Detection batch finished in {float(result['elapsed_seconds']) / 60:.1f} min: "
-            f"{result['completed_pairs']} complete "
-            f"({result['low_memory_pairs']} newly processed in low-memory mode), "
-            f"{result['skipped_pairs']} skipped, {result['failed_pairs']} failed."
-        )
+        if bool(result.get("clusters_only", False)):
+            self.detection_status.setText(
+                f"Cluster refresh finished in {float(result['elapsed_seconds']) / 60:.1f} min: "
+                f"{result['completed_pairs']} complete, {result['skipped_pairs']} skipped, "
+                f"{result['failed_pairs']} failed. Manual corrections and review state were preserved."
+            )
+        else:
+            self.detection_status.setText(
+                f"Detection batch finished in {float(result['elapsed_seconds']) / 60:.1f} min: "
+                f"{result['completed_pairs']} complete "
+                f"({result['low_memory_pairs']} newly processed in low-memory mode), "
+                f"{result['skipped_pairs']} skipped, {result['failed_pairs']} failed."
+            )
         self._prepare_detection_tab()
         self._prepare_review_tab()
         self._prepare_measurements_tab()
+        self._prepare_morphology_tab()
+        pending = self._pending_review_after_detection
+        self._pending_review_after_detection = None
+        if (
+            pending is not None
+            and self.manifest is not None
+            and self.manifest["specimens"][pending]["checkpoints"]["detection"].get(
+                "state"
+            )
+            == "complete"
+        ):
+            row = self.review_specimen.findData(int(pending))
+            if row >= 0:
+                self.review_specimen.setCurrentIndex(row)
+            self.tabs.setCurrentIndex(3)
+            self.review_queue_status.setText(
+                "The refreshed detection is ready for manual correction. Saved calcium "
+                "landmarks were retained; former spine assignments need review."
+            )
 
     @Slot(str)
     def _detection_cancelled(self, message: str) -> None:
+        self._pending_review_after_detection = None
         self.detection_status.setText(message)
         if self.project_path is not None and self.manifest is not None:
             save_project(self.project_path, self.manifest)
@@ -7458,6 +11597,7 @@ class MainWindow(QMainWindow):
         if self.morphology_saved_run.count():
             self._morphology_saved_run_changed()
         self._prepare_advanced_clustering_tab(measured)
+        self._prepare_calcium_tab()
 
     def _prepare_advanced_clustering_tab(
         self, measured: list[int] | None = None
@@ -7486,6 +11626,36 @@ class MainWindow(QMainWindow):
                 self.advanced_groups.addItem(group)
                 item = self.advanced_groups.item(self.advanced_groups.count() - 1)
                 item.setSelected(group in selected_groups if had_groups else True)
+        current_dataset = self.advanced_calcium_dataset.currentData()
+        active_dataset = (
+            self.manifest.get("calcium_analysis", {}).get("active_dataset_id")
+            if self.manifest is not None
+            else None
+        )
+        self.advanced_calcium_dataset.blockSignals(True)
+        self.advanced_calcium_dataset.clear()
+        self.advanced_calcium_dataset.addItem("No calcium dataset", "")
+        dataset_records: list[dict[str, object]] = []
+        if self.manifest is not None:
+            dataset_records = list(
+                self.manifest.get("calcium_analysis", {}).get("datasets", [])
+            )
+            if len(dataset_records) > 1:
+                self.advanced_calcium_dataset.addItem(
+                    f"All imported calcium datasets ({len(dataset_records)})",
+                    "__all__",
+                )
+            for record in dataset_records:
+                self.advanced_calcium_dataset.addItem(
+                    str(record.get("name", "Calcium dataset")),
+                    record.get("dataset_id"),
+                )
+        desired_dataset = current_dataset or active_dataset
+        if desired_dataset:
+            found = self.advanced_calcium_dataset.findData(desired_dataset)
+            if found >= 0:
+                self.advanced_calcium_dataset.setCurrentIndex(found)
+        self.advanced_calcium_dataset.blockSignals(False)
         current_run = self.advanced_saved_run.currentData()
         self.advanced_saved_run.blockSignals(True)
         self.advanced_saved_run.clear()
@@ -7528,9 +11698,35 @@ class MainWindow(QMainWindow):
             key for key, checkbox in self.advanced_features.items()
             if checkbox.isChecked()
         )
+        calcium_states = tuple(
+            state
+            for state, checkbox in (
+                ("confirmed", self.advanced_calcium_confirmed),
+                ("probable", self.advanced_calcium_probable),
+                ("ambiguous", self.advanced_calcium_ambiguous),
+            )
+            if checkbox.isChecked()
+        )
         groups = tuple(item.text() for item in self.advanced_groups.selectedItems())
         if self.advanced_groups.count() and not groups:
             raise ValueError("Select at least one experimental group for clustering.")
+        calcium_selection = str(
+            self.advanced_calcium_dataset.currentData() or ""
+        )
+        available_calcium_ids = tuple(
+            str(record.get("dataset_id", ""))
+            for record in (
+                self.manifest.get("calcium_analysis", {}).get("datasets", [])
+                if self.manifest is not None
+                else []
+            )
+            if str(record.get("dataset_id", ""))
+        )
+        calcium_dataset_ids = (
+            available_calcium_ids
+            if calcium_selection == "__all__"
+            else ((calcium_selection,) if calcium_selection else ())
+        )
         return MorphologyClusteringSettings(
             algorithm=str(self.advanced_algorithm.currentData()),
             features=features,
@@ -7561,6 +11757,11 @@ class MainWindow(QMainWindow):
             pcumap_correlation_start=self.advanced_pcumap_start.value(),
             pcumap_device=str(self.advanced_pcumap_device.currentData()),
             embedding_stability_repetitions=self.advanced_stability_repetitions.value(),
+            calcium_dataset_id=(
+                calcium_dataset_ids[0] if len(calcium_dataset_ids) == 1 else ""
+            ),
+            calcium_dataset_ids=calcium_dataset_ids,
+            calcium_match_states=calcium_states,
         )
 
     def _run_advanced_clustering(self) -> None:
@@ -7616,7 +11817,16 @@ class MainWindow(QMainWindow):
             if repeat_distance is not None else "",
             f"Across-seed cluster adjusted Rand: {float(repeat_clusters):.3f}."
             if repeat_clusters is not None else "",
-            "Protein puncta were descriptive only.",
+            (
+                "Protein puncta were clustering inputs."
+                if result.get("protein_metrics_used_for_clustering")
+                else "Protein puncta were descriptive only."
+            ),
+            (
+                "Calcium measurements were clustering inputs."
+                if result.get("calcium_metrics_used_for_clustering")
+                else "Calcium measurements were not clustering inputs."
+            ),
         ]
         self.advanced_status.setText(" ".join(value for value in values if value))
         self.advanced_diagnostics.setText(
@@ -7646,6 +11856,36 @@ class MainWindow(QMainWindow):
             )
             for key, checkbox in self.advanced_features.items():
                 checkbox.setChecked(key in settings.features)
+            selected_calcium_ids = settings.selected_calcium_dataset_ids()
+            available_calcium_ids = tuple(
+                str(record.get("dataset_id", ""))
+                for record in self.manifest.get("calcium_analysis", {}).get(
+                    "datasets", []
+                )
+                if str(record.get("dataset_id", ""))
+            )
+            desired_calcium_data = (
+                "__all__"
+                if len(selected_calcium_ids) > 1
+                and set(selected_calcium_ids) == set(available_calcium_ids)
+                else (selected_calcium_ids[0] if len(selected_calcium_ids) == 1 else "")
+            )
+            dataset_index = self.advanced_calcium_dataset.findData(
+                desired_calcium_data
+            )
+            self.advanced_calcium_dataset.setCurrentIndex(
+                max(0, dataset_index)
+            )
+            accepted_states = set(settings.calcium_match_states)
+            self.advanced_calcium_confirmed.setChecked(
+                "confirmed" in accepted_states
+            )
+            self.advanced_calcium_probable.setChecked(
+                "probable" in accepted_states
+            )
+            self.advanced_calcium_ambiguous.setChecked(
+                "ambiguous" in accepted_states
+            )
             self.advanced_algorithm.setCurrentIndex(
                 max(0, self.advanced_algorithm.findData(settings.algorithm))
             )
@@ -7719,6 +11959,37 @@ class MainWindow(QMainWindow):
             self.advanced_correlation_panel.show_run(
                 self._active_advanced_run
             )
+            self.advanced_statistics_panel.show_run(
+                self._active_advanced_run
+            )
+
+    def _save_advanced_statistics(
+        self, statistics_result: dict[str, object]
+    ) -> None:
+        if self._active_advanced_run is None:
+            return
+        self._active_advanced_run["statistics"] = dict(statistics_result)
+        try:
+            run_id = str(self._active_advanced_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_advanced_run = update_run_statistics(
+                    self.manifest,
+                    self.project_path,
+                    run_id,
+                    statistics_result,
+                )
+                self.advanced_statistics_panel.show_run(
+                    self._active_advanced_run
+                )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save statistics", str(exc))
 
     def _save_advanced_correlation_settings(
         self, correlation_settings: dict[str, object]
@@ -7811,6 +12082,22 @@ class MainWindow(QMainWindow):
         )
         for control in controls:
             control.blockSignals(False)
+        self.advanced_visible_groups.blockSignals(True)
+        self.advanced_visible_groups.clear()
+        groups = sorted(
+            {
+                str(row.get("experimental_group", ""))
+                for row in (self._active_advanced_run or {}).get("assignments", [])
+            }
+        )
+        visible = {str(group) for group in style.get("visible_groups", [])}
+        for group in groups:
+            self.advanced_visible_groups.addItem(group)
+            item = self.advanced_visible_groups.item(
+                self.advanced_visible_groups.count() - 1
+            )
+            item.setSelected(not visible or group in visible)
+        self.advanced_visible_groups.blockSignals(False)
         self.advanced_axes_color_button.setStyleSheet(
             f"background-color: {self.advanced_axes_color.name()};"
         )
@@ -7859,6 +12146,16 @@ class MainWindow(QMainWindow):
             "legend_position": str(
                 self.advanced_legend_position.currentData() or "outside_right"
             ),
+            "visible_groups": (
+                []
+                if self.advanced_visible_groups.count()
+                and len(self.advanced_visible_groups.selectedItems())
+                == self.advanced_visible_groups.count()
+                else [
+                    item.text()
+                    for item in self.advanced_visible_groups.selectedItems()
+                ]
+            ),
         }
         self._active_advanced_run["plot_style"] = style
         try:
@@ -7906,6 +12203,7 @@ class MainWindow(QMainWindow):
         current_spine = self.morphology_spine.currentData()
         self.morphology_spine.blockSignals(True)
         self.morphology_spine.clear()
+        self.morphology_spine.addItem("Select a spine to review...", None)
         specimen_value = self.morphology_specimen.currentData()
         if self.manifest is not None and specimen_value is not None:
             try:
@@ -7930,29 +12228,59 @@ class MainWindow(QMainWindow):
             if found >= 0:
                 self.morphology_spine.setCurrentIndex(found)
         self.morphology_spine.blockSignals(False)
-        if self.morphology_spine.count():
+        if self.morphology_spine.currentData() is not None:
             self._morphology_spine_changed()
+        else:
+            self._last_morphology_preview = None
+            self.morphology_status.setText(
+                "Clustering controls are ready. Select a spine only when geometry review is needed."
+            )
 
     def _morphology_spine_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
         specimen_value = self.morphology_specimen.currentData()
         spine_value = self.morphology_spine.currentData()
         if self.manifest is None or specimen_value is None or spine_value is None:
             return
-        try:
-            preview = load_morphology_preview(self.manifest, int(specimen_value), int(spine_value))
-        except (OSError, ValueError, KeyError) as exc:
-            self.morphology_status.setText(f"Cannot load spine geometry: {exc}")
+        target = (int(specimen_value), int(spine_value))
+        self._last_morphology_preview = None
+        self.morphology_status.setText(
+            f"Loading geometry for Spine {target[1]} in the background..."
+        )
+        if self._job_thread is not None:
+            self._pending_morphology_preview_target = target
+            return
+        self._pending_morphology_preview_target = None
+        worker = MorphologyPreviewWorker(self.manifest, *target)
+        worker.completed.connect(self._morphology_preview_completed)
+        self._start_worker(worker, "morphology_preview")
+
+    @Slot(object)
+    def _morphology_preview_completed(self, payload: dict[str, object]) -> None:
+        target = (int(payload["specimen_index"]), int(payload["spine_id"]))
+        current_specimen = self.morphology_specimen.currentData()
+        current_spine = self.morphology_spine.currentData()
+        current = (
+            (int(current_specimen), int(current_spine))
+            if current_specimen is not None and current_spine is not None
+            else None
+        )
+        if current != target:
+            self._pending_morphology_preview_target = current
+            return
+        preview = payload["preview"]
+        if not isinstance(preview, MorphologyPreview):
+            self.morphology_status.setText("Cannot load spine geometry: invalid preview data.")
             return
         self._last_morphology_preview = preview
         self.morphology_z.setRange(0, max(0, preview.spine_mask_stack.shape[0] - 1))
         self.morphology_z.setValue((preview.spine_z_range[0] + preview.spine_z_range[1]) // 2)
-        decision = self.manifest["specimens"][int(specimen_value)].get("morphology_review", {}).get("spines", {}).get(str(int(spine_value)), {})
+        decision = self.manifest["specimens"][target[0]].get("morphology_review", {}).get("spines", {}).get(str(target[1]), {})
         self.morphology_reviewed.setChecked(bool(decision.get("reviewed", False)))
-        validity = self.manifest["specimens"][int(specimen_value)].get("distribution_review", {}).get("spines", {}).get(str(int(spine_value)), {})
+        validity = self.manifest["specimens"][target[0]].get("distribution_review", {}).get("spines", {}).get(str(target[1]), {})
         self.morphology_invalid.setChecked(bool(validity.get("invalid_spine", False)))
         self.morphology_note.setText(str(decision.get("note", "")))
         row = preview.row
-        specimen = self.manifest["specimens"][int(specimen_value)]
+        specimen = self.manifest["specimens"][target[0]]
         self.morphology_metrics.setText(
             f"Group: {specimen['experimental_group']} | specimen: {specimen['specimen_id']} | "
             f"curvilinear length: {row.get('spine_curvilinear_length_um')} µm | "
@@ -8093,8 +12421,13 @@ class MainWindow(QMainWindow):
         )
 
     def _move_morphology_spine(self, offset: int) -> None:
-        if self.morphology_spine.count():
-            self.morphology_spine.setCurrentIndex(max(0, min(self.morphology_spine.count() - 1, self.morphology_spine.currentIndex() + int(offset))))
+        if self.morphology_spine.count() <= 1:
+            return
+        current = self.morphology_spine.currentIndex()
+        target = 1 if current <= 0 else current + int(offset)
+        self.morphology_spine.setCurrentIndex(
+            max(1, min(self.morphology_spine.count() - 1, target))
+        )
 
     def _current_morphology_settings(self) -> MorphologyClusteringSettings:
         features = tuple(key for key, checkbox in self.morphology_features.items() if checkbox.isChecked())
@@ -8195,6 +12528,37 @@ class MainWindow(QMainWindow):
             self.morphology_correlation_panel.show_run(
                 self._active_morphology_run
             )
+            self.morphology_statistics_panel.show_run(
+                self._active_morphology_run
+            )
+
+    def _save_morphology_statistics(
+        self, statistics_result: dict[str, object]
+    ) -> None:
+        if self._active_morphology_run is None:
+            return
+        self._active_morphology_run["statistics"] = dict(statistics_result)
+        try:
+            run_id = str(self._active_morphology_run.get("run_id", ""))
+            known = bool(
+                self.manifest
+                and any(
+                    str(record.get("run_id", "")) == run_id
+                    for record in self.manifest.get("morphology_analysis", {}).get("runs", [])
+                )
+            )
+            if known and self.manifest is not None and self.project_path is not None:
+                self._active_morphology_run = update_run_statistics(
+                    self.manifest,
+                    self.project_path,
+                    run_id,
+                    statistics_result,
+                )
+                self.morphology_statistics_panel.show_run(
+                    self._active_morphology_run
+                )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot save statistics", str(exc))
 
     def _save_morphology_correlation_settings(
         self, correlation_settings: dict[str, object]
@@ -8322,6 +12686,22 @@ class MainWindow(QMainWindow):
         self.morphology_custom_y.blockSignals(False)
         self.morphology_pca_show_points.blockSignals(False)
         self.morphology_pca_point_alpha.blockSignals(False)
+        self.morphology_visible_groups.blockSignals(True)
+        self.morphology_visible_groups.clear()
+        groups = sorted(
+            {
+                str(row.get("experimental_group", ""))
+                for row in (self._active_morphology_run or {}).get("assignments", [])
+            }
+        )
+        visible = {str(group) for group in style.get("visible_groups", [])}
+        for group in groups:
+            self.morphology_visible_groups.addItem(group)
+            item = self.morphology_visible_groups.item(
+                self.morphology_visible_groups.count() - 1
+            )
+            item.setSelected(not visible or group in visible)
+        self.morphology_visible_groups.blockSignals(False)
         self.morphology_feature_plot_row.setVisible(
             self.morphology_plot_mode.currentData() == "custom_features"
         )
@@ -8381,6 +12761,16 @@ class MainWindow(QMainWindow):
             "custom_y_feature": str(self.morphology_custom_y.currentData() or ""),
             "pca_show_points": self.morphology_pca_show_points.isChecked(),
             "pca_point_alpha": self.morphology_pca_point_alpha.value(),
+            "visible_groups": (
+                []
+                if self.morphology_visible_groups.count()
+                and len(self.morphology_visible_groups.selectedItems())
+                == self.morphology_visible_groups.count()
+                else [
+                    item.text()
+                    for item in self.morphology_visible_groups.selectedItems()
+                ]
+            ),
         }
         self._active_morphology_run["plot_style"] = dict(style)
         try:
@@ -8414,7 +12804,14 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _morphology_export_completed(self, result: dict[str, object]) -> None:
-        QMessageBox.information(self, "Morphology analysis exported", f"Workbook: {result.get('workbook')}\nPlots: {result.get('plot_directory')}\nReport: {result.get('report_pdf')}")
+        QMessageBox.information(
+            self,
+            "Morphology analysis exported",
+            f"Workbook: {result.get('workbook')}\n"
+            f"Plots: {result.get('plot_directory')}\n"
+            f"Report: {result.get('report_pdf')}\n"
+            f"Statistical methods: {result.get('statistical_methods')}",
+        )
 
     def _cluster_exported_morphology_workbook(self) -> None:
         source, _ = QFileDialog.getOpenFileName(
@@ -8661,7 +13058,7 @@ class MainWindow(QMainWindow):
                 int(cluster_id),
             )
         self._populate_measurement_table()
-        if self.distribution_spine.count():
+        if self.distribution_spine.count() and self.tabs.currentIndex() == 4:
             self._distribution_spine_changed()
         self._sync_distribution_bulk_acceptance()
 
@@ -8672,7 +13069,18 @@ class MainWindow(QMainWindow):
             or "cluster_positive"
         )
 
-    def _populate_spine_review_queue(self, result: dict[str, object]) -> None:
+    def _current_distribution_target(self) -> tuple[int, int] | None:
+        value = self.distribution_spine.currentData()
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            return int(value[0]), int(value[1])
+        specimen = self.measurement_specimen.currentData()
+        if value is not None and specimen is not None:
+            return int(specimen), int(value)
+        return None
+
+    def _populate_spine_review_queue(
+        self, selected_specimen_result: dict[str, object] | None = None
+    ) -> None:
         mode = self._current_spine_review_mode()
         if self._preferred_spine_review_mode is not None:
             index = self.distribution_review_mode.findData(mode)
@@ -8681,30 +13089,71 @@ class MainWindow(QMainWindow):
                 self.distribution_review_mode.setCurrentIndex(index)
                 self.distribution_review_mode.blockSignals(False)
             self._preferred_spine_review_mode = None
-        previous_spine = (
-            self._preferred_distribution_spine_id
-            if self._preferred_distribution_spine_id is not None
-            else self.distribution_spine.currentData()
-        )
+        previous_target = self._preferred_distribution_target
+        if previous_target is None and self._preferred_distribution_spine_id is not None:
+            specimen_value = self.measurement_specimen.currentData()
+            if specimen_value is not None:
+                previous_target = (
+                    int(specimen_value),
+                    int(self._preferred_distribution_spine_id),
+                )
+        if previous_target is None:
+            previous_target = self._current_distribution_target()
+        self._preferred_distribution_target = None
         self._preferred_distribution_spine_id = None
-        rows = (
-            list(result.get("distribution_rows", []))
-            if mode == "cluster_positive"
-            else [
-                row
-                for row in result.get("spine_rows", [])
-                if not bool(row.get("has_protein_cluster", False))
-            ]
-        )
+        current_specimen = self.measurement_specimen.currentData()
+        entries: list[dict[str, object]] = []
+        load_errors = 0
+        if self.manifest is not None:
+            for specimen_index, specimen in enumerate(self.manifest.get("specimens", [])):
+                if (
+                    specimen.get("checkpoints", {})
+                    .get("measurements", {})
+                    .get("state")
+                    != "complete"
+                ):
+                    continue
+                try:
+                    result = (
+                        selected_specimen_result
+                        if selected_specimen_result is not None
+                        and current_specimen is not None
+                        and specimen_index == int(current_specimen)
+                        else load_measurement_result(self.manifest, specimen_index)
+                    )
+                except (OSError, ValueError, KeyError):
+                    load_errors += 1
+                    continue
+                rows = (
+                    list(result.get("distribution_rows", []))
+                    if mode == "cluster_positive"
+                    else [
+                        row
+                        for row in result.get("spine_rows", [])
+                        if not bool(row.get("has_protein_cluster", False))
+                    ]
+                )
+                review_key = (
+                    "distribution_reviewed"
+                    if mode == "cluster_positive"
+                    else "validity_reviewed"
+                )
+                for row in rows:
+                    entries.append(
+                        {
+                            "target": (specimen_index, int(row["spine_id"])),
+                            "group": str(specimen.get("experimental_group", "")),
+                            "specimen_id": str(specimen.get("specimen_id", "")),
+                            "row": row,
+                            "reviewed": bool(row.get(review_key, False)),
+                        }
+                    )
+        self._distribution_queue_entries = entries
         self.distribution_spine.blockSignals(True)
         self.distribution_spine.clear()
-        review_key = (
-            "distribution_reviewed"
-            if mode == "cluster_positive"
-            else "validity_reviewed"
-        )
-        for row in rows:
-            reviewed = bool(row.get(review_key, False))
+        for entry in entries:
+            row = entry["row"]
+            reviewed = bool(entry["reviewed"])
             valid = bool(row.get("spine_valid", True))
             if mode == "cluster_positive":
                 state = (
@@ -8721,21 +13170,22 @@ class MainWindow(QMainWindow):
                 state = "invalid" if not valid else "valid"
                 detail = ""
             self.distribution_spine.addItem(
-                f"Spine {row['spine_id']} — "
+                f"{entry['group']} / {entry['specimen_id']} / Spine {row['spine_id']} — "
                 f"{'reviewed' if reviewed else 'unreviewed'}; {state}{detail}",
-                int(row["spine_id"]),
+                entry["target"],
             )
-        selected = (
-            self.distribution_spine.findData(previous_spine)
-            if previous_spine is not None
-            else -1
+        selected = next(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if entry["target"] == previous_target
+            ),
+            -1,
         )
         if selected < 0:
             selected = next(
                 (
-                    index
-                    for index, row in enumerate(rows)
-                    if not bool(row.get(review_key, False))
+                    index for index, entry in enumerate(entries) if not entry["reviewed"]
                 ),
                 0,
             )
@@ -8756,20 +13206,19 @@ class MainWindow(QMainWindow):
                 else "No cluster-less spines"
             )
             self.distribution_preview_status.setText(
-                "This optional review queue is empty for the selected specimen."
+                "This project-wide review queue is empty."
+            )
+        elif load_errors:
+            self.distribution_preview_status.setText(
+                f"Project-wide queue loaded, but {load_errors} measured specimen(s) could not be read."
             )
 
     def _distribution_review_mode_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
-        if self.manifest is None or self.measurement_specimen.currentData() is None:
+        if self.manifest is None:
             return
-        try:
-            result = load_measurement_result(
-                self.manifest, int(self.measurement_specimen.currentData())
-            )
-        except (OSError, ValueError, KeyError):
-            return
+        self._preferred_distribution_target = None
         self._preferred_distribution_spine_id = None
-        self._populate_spine_review_queue(result)
+        self._populate_spine_review_queue()
         if self.distribution_spine.count():
             self._distribution_spine_changed()
 
@@ -8805,17 +13254,15 @@ class MainWindow(QMainWindow):
         self.distribution_chart.set_profile(row if isinstance(row, dict) else None)
 
     def _distribution_spine_changed(self, *_args) -> None:  # type: ignore[no-untyped-def]
-        if (
-            self.manifest is None
-            or self.measurement_specimen.currentData() is None
-            or self.distribution_spine.currentData() is None
-        ):
+        target = self._current_distribution_target()
+        if self.manifest is None or target is None:
             return
-        specimen_index = int(self.measurement_specimen.currentData())
-        spine_id = int(self.distribution_spine.currentData())
+        specimen_index, spine_id = target
         review_mode = self._current_spine_review_mode()
         positive_mode = review_mode == "cluster_positive"
-        self._last_distribution_preview = None
+        expected_target = (review_mode, specimen_index, spine_id)
+        if self._last_distribution_preview_target != expected_target:
+            self._last_distribution_preview = None
         self.centerline_hint_button.setEnabled(False)
         self.centerline_hint_button.blockSignals(True)
         self.centerline_hint_button.setChecked(False)
@@ -8857,8 +13304,10 @@ class MainWindow(QMainWindow):
             if positive_mode
             else "Cluster-less spine (optional quality review)"
         )
+        specimen = self.manifest["specimens"][specimen_index]
         self.distribution_spine_header.setText(
-            f"{kind_label} — Spine {spine_id} — {position} of {count}"
+            f"{kind_label} — {specimen['experimental_group']} / "
+            f"{specimen['specimen_id']} / Spine {spine_id} — {position} of {count}"
         )
         self.distribution_preview_status.setText(
             f"Loading Spine {spine_id}. "
@@ -8869,21 +13318,47 @@ class MainWindow(QMainWindow):
             )
         )
         if self._job_thread is not None:
+            self._pending_distribution_preview_target = (
+                review_mode,
+                specimen_index,
+                spine_id,
+            )
             self.distribution_preview_status.setText(
                 "Distribution row is ready; its image preview will load when the current background operation finishes."
             )
             return
+        if (
+            self._last_distribution_preview is not None
+            and self._last_distribution_preview_target == expected_target
+        ):
+            return
+        self._pending_distribution_preview_target = None
         worker = DistributionPreviewWorker(
             self.manifest, specimen_index, spine_id, review_mode
         )
-        worker.completed.connect(self._distribution_preview_completed)
+        worker.completed.connect(
+            lambda preview, expected=expected_target: self._distribution_preview_completed(
+                preview, expected
+            )
+        )
         self._start_worker(worker, "distribution_preview")
 
-    @Slot(object)
     def _distribution_preview_completed(
-        self, preview: DistributionPreview | SpineReviewPreview
+        self,
+        preview: DistributionPreview | SpineReviewPreview,
+        expected_target: tuple[str, int, int] | None = None,
     ) -> None:
+        current = self._current_distribution_target()
+        current_target = (
+            (self._current_spine_review_mode(), current[0], current[1])
+            if current is not None
+            else None
+        )
+        if expected_target is not None and current_target != expected_target:
+            self._pending_distribution_preview_target = current_target
+            return
         self._last_distribution_preview = preview
+        self._last_distribution_preview_target = current_target
         if isinstance(preview, SpineReviewPreview):
             self.centerline_hint_button.setEnabled(False)
             spine_id = int(preview.row["spine_id"])
@@ -9092,12 +13567,8 @@ class MainWindow(QMainWindow):
             preview.crop_origin_yx[0] + local_y,
             preview.crop_origin_yx[1] + local_x,
         )
-        if (
-            self.manifest is None
-            or self.project_path is None
-            or self.measurement_specimen.currentData() is None
-            or self.distribution_spine.currentData() is None
-        ):
+        target = self._current_distribution_target()
+        if self.manifest is None or self.project_path is None or target is None:
             return
         self.distribution_preview_status.setText(
             f"Applying endpoint at Z {z_index + 1}; rebuilding this spine’s centerline…"
@@ -9105,19 +13576,19 @@ class MainWindow(QMainWindow):
         worker = CenterlineHintWorker(
             self.manifest,
             self.project_path,
-            int(self.measurement_specimen.currentData()),
-            int(self.distribution_spine.currentData()),
+            target[0],
+            target[1],
             global_point,
         )
         worker.completed.connect(self._centerline_hint_completed)
         self._start_worker(worker, "centerline_hint")
 
     def _clear_centerline_hint(self) -> None:
+        target = self._current_distribution_target()
         if (
             self.manifest is None
             or self.project_path is None
-            or self.measurement_specimen.currentData() is None
-            or self.distribution_spine.currentData() is None
+            or target is None
             or self._job_thread is not None
         ):
             return
@@ -9127,8 +13598,8 @@ class MainWindow(QMainWindow):
         worker = CenterlineHintWorker(
             self.manifest,
             self.project_path,
-            int(self.measurement_specimen.currentData()),
-            int(self.distribution_spine.currentData()),
+            target[0],
+            target[1],
             None,
         )
         worker.completed.connect(self._centerline_hint_completed)
@@ -9142,6 +13613,8 @@ class MainWindow(QMainWindow):
         self.distribution_dendrite_view.point_mode = False
         self.distribution_dendrite_view.setCursor(Qt.CursorShape.ArrowCursor)
         self.distribution_z_controls.setVisible(False)
+        self._last_distribution_preview = None
+        self._last_distribution_preview_target = None
         self._centerline_hint_pending_reload = True
         self._refresh_distribution_groups()
         self._populate_measurement_table()
@@ -9155,15 +13628,10 @@ class MainWindow(QMainWindow):
             self.distribution_spine.setCurrentIndex((self.distribution_spine.currentIndex() + offset) % count)
 
     def _save_distribution_review(self) -> None:
-        if (
-            self.manifest is None
-            or self.project_path is None
-            or self.measurement_specimen.currentData() is None
-            or self.distribution_spine.currentData() is None
-        ):
+        target = self._current_distribution_target()
+        if self.manifest is None or self.project_path is None or target is None:
             return
-        specimen_index = int(self.measurement_specimen.currentData())
-        spine_id = int(self.distribution_spine.currentData())
+        specimen_index, spine_id = target
         review_mode = self._current_spine_review_mode()
         try:
             if review_mode == "cluster_positive":
@@ -9188,34 +13656,39 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "Cannot save spine review", str(exc))
             return
-        if review_mode == "cluster_positive":
-            candidates = updated.get("distribution_rows", [])
-            review_key = "distribution_reviewed"
-        else:
-            candidates = [
-                row
-                for row in updated.get("spine_rows", [])
-                if not bool(row.get("has_protein_cluster", False))
-            ]
-            review_key = "validity_reviewed"
-        next_id = next(
+        current_index = next(
             (
-                int(row["spine_id"])
-                for row in candidates
-                if not bool(row.get(review_key, False))
+                index
+                for index, entry in enumerate(self._distribution_queue_entries)
+                if entry.get("target") == target
+            ),
+            -1,
+        )
+        ordered = (
+            self._distribution_queue_entries[current_index + 1 :]
+            + self._distribution_queue_entries[:current_index]
+            if current_index >= 0
+            else self._distribution_queue_entries
+        )
+        next_target = next(
+            (
+                entry["target"]
+                for entry in ordered
+                if entry.get("target") != target and not bool(entry.get("reviewed", False))
             ),
             None,
         )
-        self._preferred_distribution_spine_id = next_id
+        self._preferred_distribution_target = next_target
+        self._preferred_distribution_spine_id = None
         self._preferred_spine_review_mode = review_mode
         self._refresh_distribution_groups()
-        # Refresh labels, then advance to the first remaining unreviewed spine.
+        # Refresh the project-wide labels, then advance to another unreviewed spine.
         self._measurement_specimen_changed()
-        if next_id is None:
+        if next_target is None:
             self.distribution_preview_status.setText(
-                "All cluster-positive spines in this specimen have been reviewed."
+                "All cluster-positive spines in the project have been reviewed."
                 if review_mode == "cluster_positive"
-                else "Optional cluster-less spine review is complete for this specimen."
+                else "Optional cluster-less spine review is complete for the project."
             )
 
     def _distribution_bulk_acceptance_state(self) -> tuple[int, int]:
@@ -9907,8 +14380,10 @@ class MainWindow(QMainWindow):
             self.preprocess_specimen.setCurrentIndex(row)
         self.tabs.setCurrentIndex(1)
         self.preprocessing_status.setText(
-            "Edit both channel parameters or ROIs, then choose ‘Preprocess selected specimen’. "
-            "Detection will rerun automatically and existing corrections will be discarded."
+            "Choose ‘Preprocess selected channel’ to refresh only the displayed channel, "
+            "or ‘Preprocess selected specimen’ to refresh both. A protein-cluster-only "
+            "refresh preserves manual dendrite/spine corrections; either full-specimen or "
+            "dendrite/spine refresh discards them after confirmation."
         )
 
     def _review_edit_detection(self) -> None:
@@ -10198,17 +14673,13 @@ class MainWindow(QMainWindow):
             self._move_review_specimen(1)
 
     def _open_spine_map(self, focus_only: bool) -> None:
-        if (
-            self.manifest is None
-            or self.measurement_specimen.currentData() is None
-            or self.distribution_spine.currentData() is None
-        ):
+        target = self._current_distribution_target()
+        if self.manifest is None or target is None:
             self.distribution_preview_status.setText(
-                "Select a measured specimen and spine before opening its full-field map."
+                "Select a spine from the project-wide review queue before opening its full-field map."
             )
             return
-        specimen_index = int(self.measurement_specimen.currentData())
-        spine_id = int(self.distribution_spine.currentData())
+        specimen_index, spine_id = target
         role_channels = {
             role: channel for channel, role in self.manifest["channel_roles"].items()
         }
@@ -10276,7 +14747,11 @@ class MainWindow(QMainWindow):
             focus_only=self._spine_map_focus_only,
             parent=self,
         )
-        dialog.spine_selected.connect(self._spine_map_selected)
+        dialog.spine_selected.connect(
+            lambda spine_id, index=int(specimen_index): self._spine_map_selected(
+                spine_id, index
+            )
+        )
         dialog.destroyed.connect(
             lambda *_args, target=dialog: self._forget_spine_map_dialog(target)
         )
@@ -10285,13 +14760,19 @@ class MainWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
-    @Slot(int)
-    def _spine_map_selected(self, spine_id: int) -> None:
-        if self.manifest is None or self.measurement_specimen.currentData() is None:
+    def _spine_map_selected(
+        self, spine_id: int, specimen_index: int | None = None
+    ) -> None:
+        if self.manifest is None:
             return
+        if specimen_index is None:
+            target = self._current_distribution_target()
+            if target is None:
+                return
+            specimen_index = target[0]
         try:
             result = load_measurement_result(
-                self.manifest, int(self.measurement_specimen.currentData())
+                self.manifest, int(specimen_index)
             )
             row = next(
                 item
@@ -10305,8 +14786,11 @@ class MainWindow(QMainWindow):
             if bool(row.get("has_protein_cluster", False))
             else "cluster_less"
         )
-        self._preferred_distribution_spine_id = spine_id
-        self._measurement_specimen_changed()
+        self._preferred_distribution_target = (int(specimen_index), int(spine_id))
+        self._preferred_distribution_spine_id = None
+        self._populate_spine_review_queue()
+        if self.distribution_spine.count():
+            self._distribution_spine_changed()
 
     def _forget_spine_map_dialog(self, dialog: SpineMapDialog) -> None:
         if dialog in self._spine_map_dialogs:
@@ -10672,6 +15156,36 @@ class MainWindow(QMainWindow):
             ):
                 dialog.close()
 
+    def _invalidate_calcium_after_synpo_change(
+        self, specimen_index: int, *, reason: str
+    ) -> dict[str, int]:
+        """Drop derived scenes/match approvals but retain saved landmarks."""
+
+        self._calcium_scene_cache.pop(int(specimen_index), None)
+        empty = {
+            "invalidated_matches": 0,
+            "updated_datasets": 0,
+            "preserved_registrations": 0,
+        }
+        if self.manifest is None or self.project_path is None:
+            return empty
+        counts = invalidate_calcium_matches_for_specimen(
+            self.manifest,
+            self.project_path,
+            specimen_index,
+            reason=reason,
+        )
+        active = getattr(self, "_active_calcium_dataset", None)
+        active_id = str((active or {}).get("dataset_id", ""))
+        if active_id and counts["updated_datasets"]:
+            try:
+                self._active_calcium_dataset = load_calcium_dataset(
+                    self.manifest, active_id
+                )
+            except (OSError, ValueError):
+                self._active_calcium_dataset = None
+        return counts
+
     def _scan_source(self) -> None:
         if self._review_thread is not None:
             QMessageBox.information(
@@ -10712,6 +15226,7 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(4, False)
         self.tabs.setTabEnabled(5, False)
         self.tabs.setTabEnabled(6, False)
+        self.tabs.setTabEnabled(7, False)
         worker.completed.connect(self._scan_completed)
         self._start_worker(worker, "scan")
 
@@ -10853,21 +15368,48 @@ class MainWindow(QMainWindow):
         if self._job_kind == "preprocess" and self.manifest is not None:
             self._pending_detection_after_preprocess = None
             self._pending_detection_ready = None
+            self._pending_cluster_detection_after_preprocess = False
+            self._pending_cluster_detection_ready = False
             self.preprocessing_status.setText(
                 "Preprocessing stopped with an error. Completed cache slices remain resumable."
             )
             if self.project_path is not None:
                 save_project(self.project_path, self.manifest)
         elif self._job_kind == "detection" and self.manifest is not None:
+            self._pending_review_after_detection = None
             self.detection_status.setText(
                 "Detection stopped with an error. Completed specimen checkpoints remain usable."
             )
             if self.project_path is not None:
                 save_project(self.project_path, self.manifest)
-        elif self._job_kind in {"measurements", "trim_preview", "distribution_preview", "centerline_hint", "export"}:
+        elif self._job_kind in {
+            "measurements",
+            "trim_preview",
+            "distribution_preview",
+            "centerline_hint",
+            "morphology_preview",
+            "export",
+        }:
             self.measurement_status.setText(
                 "Measurement operation stopped with an error; completed checkpoints remain usable."
             )
+            if self._job_kind == "morphology_preview":
+                self.morphology_status.setText(
+                    f"Cannot load spine geometry: {message}"
+                )
+        elif str(self._job_kind).startswith("calcium_"):
+            self.calcium_dataset_status.setText(
+                "Calcium matching operation stopped with an error; saved registrations "
+                "and reviewed matches remain usable."
+            )
+            if self._job_kind == "calcium_match_scene":
+                self._pending_calcium_match_uid = None
+                self.calcium_match_synpo_view.show_placeholder(
+                    "Could not prepare the matched Synpo projection"
+                )
+                self.calcium_match_visual_status.setText(
+                    f"Cannot display the match overlay: {message}"
+                )
         QMessageBox.critical(self, "Operation failed", message)
 
     @Slot()
@@ -10899,6 +15441,11 @@ class MainWindow(QMainWindow):
         self._job_thread = None
         self._job_kind = None
         self._set_job_running(False)
+        if (
+            finished_kind == "calcium_import"
+            and self._active_calcium_dataset is not None
+        ):
+            QTimer.singleShot(0, self._calcium_registration_pair_changed)
         if finished_kind == "preview" and self._preview_requested_while_busy:
             self._preview_requested_while_busy = False
             self._preview_timer.start()
@@ -10908,13 +15455,7 @@ class MainWindow(QMainWindow):
             self._centerline_hint_pending_reload = False
             QTimer.singleShot(0, self._distribution_spine_changed)
         elif finished_kind == "preprocess":
-            pending = getattr(self, "_pending_detection_ready", None)
-            self._pending_detection_after_preprocess = None
-            self._pending_detection_ready = None
-            if pending is not None:
-                QTimer.singleShot(
-                    0, lambda index=pending: self._run_selected_detection(index, force=True)
-                )
+            self._continue_selected_preprocessing_pipeline()
         elif finished_kind == "transfer_import" and self._pending_transfer_recovery:
             request = self._pending_transfer_recovery
             self._pending_transfer_recovery = None
@@ -10928,6 +15469,29 @@ class MainWindow(QMainWindow):
                     recover_as_settings_only=True,
                 ),
             )
+        if self._pending_distribution_preview_target is not None:
+            current = self._current_distribution_target()
+            expected = (
+                (self._current_spine_review_mode(), current[0], current[1])
+                if current is not None
+                else None
+            )
+            self._pending_distribution_preview_target = None
+            if expected is not None:
+                QTimer.singleShot(0, self._distribution_spine_changed)
+        if self._pending_morphology_preview_target is not None:
+            specimen = self.morphology_specimen.currentData()
+            spine = self.morphology_spine.currentData()
+            current_morphology = (
+                (int(specimen), int(spine))
+                if specimen is not None and spine is not None
+                else None
+            )
+            self._pending_morphology_preview_target = None
+            if current_morphology is not None:
+                QTimer.singleShot(0, self._morphology_spine_changed)
+        if self._pending_calcium_match_uid is not None:
+            QTimer.singleShot(0, self._render_calcium_match_review)
 
     @Slot(object)
     def _scan_completed(self, report: ScanReport) -> None:
@@ -10968,6 +15532,7 @@ class MainWindow(QMainWindow):
                 (f"Ready ({pair.import_mode})" if pair.valid else "Error"),
                 pair.experimental_group,
                 pair.specimen_id,
+                pair.neuron_id or pair.specimen_id,
                 pair.channels.get("ChanA").filename if "ChanA" in pair.channels else "—",
                 pair.channels.get("ChanB").filename if "ChanB" in pair.channels else "—",
                 pair.shape_text,
@@ -10975,19 +15540,86 @@ class MainWindow(QMainWindow):
                 issue_text,
             ]
             for column, value in enumerate(values):
-                editable = column in {1, 2}
+                editable = column in {1, 2, 3}
                 self._set_table_item(row, column, value, editable=editable)
             if "ChanA" in pair.channels:
-                self.table.item(row, 3).setToolTip(
+                self.table.item(row, 4).setToolTip(
                     str(pair.channels["ChanA"].path)
                 )
             if "ChanB" in pair.channels:
-                self.table.item(row, 4).setToolTip(
+                self.table.item(row, 5).setToolTip(
                     str(pair.channels["ChanB"].path)
                 )
             self.table.item(row, 0).setBackground(
                 QColor("#dff3e4") if pair.valid else QColor("#f8d7da")
             )
+        self._refresh_manual_group_choices()
+
+    def _refresh_manual_group_choices(self) -> None:
+        if not hasattr(self, "manual_group_name"):
+            return
+        current = self.manual_group_name.currentText().strip()
+        groups = sorted(
+            {
+                self.table.item(row, 1).text().strip()
+                for row in range(self.table.rowCount())
+                if self.table.item(row, 1) is not None
+                and self.table.item(row, 1).text().strip()
+            },
+            key=str.casefold,
+        )
+        self.manual_group_name.blockSignals(True)
+        self.manual_group_name.clear()
+        self.manual_group_name.addItems(groups)
+        self.manual_group_name.setCurrentText(current or (groups[0] if groups else ""))
+        self.manual_group_name.blockSignals(False)
+
+    def _assign_selected_specimens_to_group(self) -> None:
+        group = self.manual_group_name.currentText().strip()
+        if not group:
+            QMessageBox.warning(
+                self, "Missing group name", "Enter a name for the experimental group."
+            )
+            return
+        rows = sorted(
+            {index.row() for index in self.table.selectionModel().selectedRows()}
+        )
+        if not rows and self.table.currentRow() >= 0:
+            rows = [self.table.currentRow()]
+        if not rows:
+            QMessageBox.information(
+                self,
+                "No specimens selected",
+                "Select one or more specimen rows in the batch table first.",
+            )
+            return
+        for row in rows:
+            item = self.table.item(row, 1)
+            if item is not None:
+                item.setText(group)
+        try:
+            if self.report is not None:
+                self._sync_scan_edits()
+            if self.manifest is not None:
+                self._sync_manifest_edits()
+                if self.project_path is not None:
+                    save_project(self.project_path, self.manifest)
+                self._prepare_preprocessing_tab()
+                self._prepare_detection_tab()
+                self._prepare_review_tab()
+                self._prepare_measurements_tab()
+                self._prepare_morphology_tab()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Cannot assign group", str(exc))
+            if self.manifest is not None:
+                self._populate_manifest(self.manifest)
+            return
+        self._refresh_manual_group_choices()
+        self.manual_group_name.setCurrentText(group)
+        self.statusBar().showMessage(
+            f"Assigned {len(rows)} specimen(s) to experimental group {group!r}.",
+            8000,
+        )
 
     def _set_table_item(self, row: int, column: int, value: str, *, editable: bool = False) -> None:
         item = QTableWidgetItem(value)
@@ -11003,10 +15635,19 @@ class MainWindow(QMainWindow):
         for row, pair in enumerate(self.report.pairs):
             group = self.table.item(row, 1).text().strip()
             specimen = self.table.item(row, 2).text().strip()
-            if not group or not specimen:
-                raise ValueError("Experimental group and specimen labels cannot be empty.")
+            neuron_item = self.table.item(row, 3)
+            neuron_id = (
+                neuron_item.text().strip()
+                if neuron_item is not None
+                else (pair.neuron_id.strip() or specimen)
+            )
+            if not group or not specimen or not neuron_id:
+                raise ValueError(
+                    "Experimental group, specimen, and neuron / subject ID cannot be empty."
+                )
             pair.experimental_group = group
             pair.specimen_id = specimen
+            pair.neuron_id = neuron_id
 
     def _sync_manifest_edits(self) -> None:
         if self.manifest is None:
@@ -11014,17 +15655,47 @@ class MainWindow(QMainWindow):
         if not self.output_edit.text().strip():
             raise ValueError("Select an output folder.")
         seen: set[tuple[str, str]] = set()
+        labels: list[tuple[str, str, str]] = []
         for row, specimen_data in enumerate(self.manifest["specimens"]):
             group = self.table.item(row, 1).text().strip()
             specimen = self.table.item(row, 2).text().strip()
-            if not group or not specimen:
-                raise ValueError("Experimental group and specimen labels cannot be empty.")
+            neuron_item = self.table.item(row, 3)
+            neuron_id = (
+                neuron_item.text().strip()
+                if neuron_item is not None
+                else str(specimen_data.get("neuron_id") or specimen)
+            )
+            if not group or not specimen or not neuron_id:
+                raise ValueError(
+                    "Experimental group, specimen, and neuron / subject ID cannot be empty."
+                )
             key = (group.casefold(), specimen.casefold())
             if key in seen:
                 raise ValueError(f"Duplicate group/specimen label: {group} / {specimen}")
             seen.add(key)
+            labels.append((group, specimen, neuron_id))
+        changed_labels: list[int] = []
+        for row, (group, specimen, neuron_id) in enumerate(labels):
+            specimen_data = self.manifest["specimens"][row]
+            if (
+                str(specimen_data.get("experimental_group", "")) != group
+                or str(specimen_data.get("specimen_id", "")) != specimen
+                or str(
+                    specimen_data.get(
+                        "neuron_id", specimen_data.get("specimen_id", "")
+                    )
+                )
+                != neuron_id
+            ):
+                changed_labels.append(row)
             specimen_data["experimental_group"] = group
             specimen_data["specimen_id"] = specimen
+            specimen_data["neuron_id"] = neuron_id
+        for specimen_index in changed_labels:
+            synchronize_measurement_labels(self.manifest, specimen_index)
+        if changed_labels:
+            for run in self.manifest.get("morphology_analysis", {}).get("runs", []):
+                run["stale"] = True
         self.manifest["source_directory"] = self.source_edit.text().strip()
         self.manifest["output_directory"] = str(Path(self.output_edit.text().strip()).resolve())
         self.manifest["channel_roles"] = self._current_roles()
@@ -11143,6 +15814,24 @@ class MainWindow(QMainWindow):
         for dialog in list(self._spine_map_dialogs):
             dialog.close()
         self._context_cache.clear()
+        # Project-local review filters must not leak from the previously opened
+        # project. In particular, a reviewed-only setting can make a new project
+        # with no geometry checkpoints appear to contain zero usable spines.
+        self.morphology_reviewed_only.setChecked(False)
+        self.advanced_reviewed_only.setChecked(False)
+        self.morphology_spine.blockSignals(True)
+        self.morphology_spine.clear()
+        self.morphology_spine.blockSignals(False)
+        self._last_morphology_preview = None
+        self._pending_morphology_preview_target = None
+        self._preferred_distribution_target = None
+        self._preferred_distribution_spine_id = None
+        self._distribution_queue_entries = []
+        self._pending_distribution_preview_target = None
+        self._last_distribution_preview_target = None
+        self._pending_calcium_match_uid = None
+        self._active_calcium_dataset = None
+        self._calcium_scene_cache.clear()
         self.manifest = manifest
         self.project_path = selected.resolve()
         self._record_diagnostic_project_context()
@@ -11397,6 +16086,7 @@ class MainWindow(QMainWindow):
                 "Saved",
                 specimen["experimental_group"],
                 specimen["specimen_id"],
+                specimen.get("neuron_id", specimen["specimen_id"]),
                 channel_a["filename"],
                 channel_b["filename"],
                 " × ".join(str(value) for value in metadata_a["shape"]) if same_shape else "mismatch",
@@ -11404,13 +16094,16 @@ class MainWindow(QMainWindow):
                 "",
             ]
             for column, value in enumerate(values):
-                self._set_table_item(row, column, str(value), editable=column in {1, 2})
-            self.table.item(row, 3).setToolTip(
+                self._set_table_item(
+                    row, column, str(value), editable=column in {1, 2, 3}
+                )
+            self.table.item(row, 4).setToolTip(
                 str(channel_source_path(manifest, channel_a))
             )
-            self.table.item(row, 4).setToolTip(
+            self.table.item(row, 5).setToolTip(
                 str(channel_source_path(manifest, channel_b))
             )
+        self._refresh_manual_group_choices()
 
     def _verify_sources(self) -> None:
         if self.manifest is None:
@@ -11495,6 +16188,11 @@ class MainWindow(QMainWindow):
         self._last_detection = None
         self._last_review = None
         self._last_distribution_preview = None
+        self._last_distribution_preview_target = None
+        self._pending_distribution_preview_target = None
+        self._distribution_queue_entries = []
+        self._preferred_distribution_target = None
+        self._pending_morphology_preview_target = None
         self._preview_statistics.clear()
         self.tabs.setTabEnabled(1, False)
         self.tabs.setTabEnabled(2, False)
@@ -11502,6 +16200,13 @@ class MainWindow(QMainWindow):
         self.tabs.setTabEnabled(4, False)
         self.tabs.setTabEnabled(5, False)
         self.tabs.setTabEnabled(6, False)
+        self.tabs.setTabEnabled(7, False)
+        self._active_calcium_dataset = None
+        self._calcium_scene_cache.clear()
+        self._pending_calcium_match_uid = None
+        self.calcium_dataset.clear()
+        self.calcium_recording.clear()
+        self.calcium_match_table.setRowCount(0)
         self.source_edit.clear()
         self.output_edit.clear()
         self.table.setRowCount(0)
@@ -11512,6 +16217,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(running)
         for widget in (self.scan_button, self.manual_pair_button, self.save_button):
             widget.setEnabled(not running)
+        if hasattr(self, "assign_group_button"):
+            self.assign_group_button.setEnabled(not running)
+            self.manual_group_name.setEnabled(not running)
         for action in (
             self.new_action,
             self.open_action,
@@ -11527,6 +16235,9 @@ class MainWindow(QMainWindow):
             self.run_preprocessing_button.setEnabled(not running and self.manifest is not None)
             self.apply_preprocessing_button.setEnabled(not running and self.manifest is not None)
             self.run_selected_preprocessing_button.setEnabled(
+                not running and self.manifest is not None
+            )
+            self.run_selected_specimen_preprocessing_button.setEnabled(
                 not running and self.manifest is not None
             )
             self.cancel_preprocessing_button.setEnabled(
@@ -11632,6 +16343,26 @@ class MainWindow(QMainWindow):
             self.morphology_reviewed_only.setEnabled(not running and measured)
             self.export_morphology_button.setEnabled(not running and self._active_morphology_run is not None)
             self.morphology_geometry_group.setEnabled(not running and measured)
+        if hasattr(self, "calcium_import_button"):
+            measured = bool(
+                self.manifest
+                and any(
+                    specimen["checkpoints"].get("measurements", {}).get("state")
+                    == "complete"
+                    for specimen in self.manifest["specimens"]
+                )
+            )
+            has_dataset = self._active_calcium_dataset is not None
+            self.calcium_import_button.setEnabled(not running and measured)
+            self.calcium_relink_button.setEnabled(not running and has_dataset)
+            self.calcium_save_registration_button.setEnabled(
+                not running and has_dataset
+            )
+            self.calcium_automatch_button.setEnabled(not running and has_dataset)
+            self.calcium_export_button.setEnabled(not running and has_dataset)
+            self.calcium_save_analysis_button.setEnabled(
+                not running and has_dataset
+            )
         if not running and not self.progress_label.text():
             self.progress_label.setText("Ready")
 
